@@ -1,0 +1,5 @@
+lane_type,capex_clp,maintenance_clp_per_year,opex_clp_per_hour,wage_clp_per_hour,supervisors,wage_total_clp_per_hour,useful_life_years
+regular,8000000,800000,400,4500,1.0,4500,5
+express,8000000,800000,420,4500,1.0,4500,5
+priority,8000000,800000,400,4700,1.0,4700,5
+self_checkout,25000000,1500000,100,2000,0.4,2100,5
