@@ -107,6 +107,14 @@ def _sanitize_sheet_name(name: str) -> str:
     return (clean or "Sheet")[:30]
 
 
+def _write_number_safe(worksheet, row: int, col: int, value, cell_format):
+    """Escribe numeros manejando NaN/None para evitar errores de xlsxwriter."""
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        worksheet.write_blank(row, col, None, cell_format)
+    else:
+        worksheet.write(row, col, value, cell_format)
+
+
 def export_kpi_report(export_root: Path, tables: dict[str, Optional[pd.DataFrame]]) -> Optional[Path]:
     valid_tables = {k: df for k, df in tables.items() if isinstance(df, pd.DataFrame) and not df.empty}
     if not valid_tables:
@@ -134,10 +142,12 @@ def export_formatted_excel_report(
     export_root: Path,
     profit_df: Optional[pd.DataFrame],
     profit_day_df: Optional[pd.DataFrame],
+    wait_day_profile_df: Optional[pd.DataFrame],
+    service_time_df: Optional[pd.DataFrame],
+    tac_lane_df: Optional[pd.DataFrame],
     tac_df: Optional[pd.DataFrame],
     tmc_df: Optional[pd.DataFrame],
     hv_df: Optional[pd.DataFrame],
-    service_time_df: Optional[pd.DataFrame],
     client_counts_df: Optional[pd.DataFrame],
     little_df: Optional[pd.DataFrame],
 ) -> Optional[Path]:
@@ -147,15 +157,23 @@ def export_formatted_excel_report(
         print("xlsxwriter no esta instalado; se omite el reporte formateado.")
         return None
 
-    if (
-        profit_df is None
-        or profit_day_df is None
-        or tac_df is None
-        or tmc_df is None
-        or hv_df is None
-        or service_time_df is None
-    ):
-        print("Datos insuficientes para generar el reporte formateado.")
+    required_tables = {
+        "profit_df": profit_df,
+        "profit_day_df": profit_day_df,
+        "wait_day_profile_df": wait_day_profile_df,
+        "service_time_df": service_time_df,
+        "tac_lane_df": tac_lane_df,
+    }
+    missing = [
+        name
+        for name, table in required_tables.items()
+        if not isinstance(table, pd.DataFrame) or table.empty
+    ]
+    if missing:
+        print(
+            "Datos insuficientes para generar el reporte formateado. "
+            f"Tablas faltantes/vacias: {', '.join(missing)}"
+        )
         return None
 
     import xlsxwriter
@@ -165,164 +183,190 @@ def export_formatted_excel_report(
     excel_path = export_root / f"kpi_formato_{timestamp}.xlsx"
 
     wb = xlsxwriter.Workbook(excel_path)
-    ws = wb.add_worksheet("KPIs")
 
-    fmt_header_profit = wb.add_format(
+    fmt_header = wb.add_format(
         {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#7FBFE7", "border": 1}
     )
-    fmt_header_tac = wb.add_format(
-        {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#8ED081", "border": 1}
+    fmt_subheader = wb.add_format(
+        {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#D9E1F2", "border": 1}
     )
-    fmt_header_tmc = wb.add_format(
-        {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#D998D2", "border": 1}
-    )
-    fmt_header_hv = wb.add_format(
-        {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#F4A582", "border": 1}
-    )
-    fmt_subheader = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#D9E1F2", "border": 1})
-    fmt_subheader_green = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#C6EFCE", "border": 1})
-    fmt_subheader_pink = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#F2DCDB", "border": 1})
-    fmt_header_service = wb.add_format(
-        {"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#FFE699", "border": 1}
-    )
-    fmt_subheader_service = wb.add_format({"bold": True, "align": "center", "valign": "vcenter", "bg_color": "#FFF2CC", "border": 1})
     fmt_number = wb.add_format({"num_format": "#,##0", "border": 1})
     fmt_decimal = wb.add_format({"num_format": "0.00", "border": 1})
     fmt_percent = wb.add_format({"num_format": "0.00", "border": 1})
     fmt_text = wb.add_format({"border": 1})
 
-    def _write_number_safe(sheet, row, col, value, fmt):
-        if value is None:
-            sheet.write_blank(row, col, None, fmt)
-        elif isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
-            sheet.write_blank(row, col, None, fmt)
-        else:
-            sheet.write(row, col, value, fmt)
-
-    def write_profit_section(start_row: int, start_col: int) -> int:
-        ws.merge_range(start_row, start_col, start_row, start_col + 5, "PROFIT", fmt_header_profit)
-        ws.write_row(
-            start_row + 2,
-            start_col,
-            [
-                "Caso Base",
-                "Simulacion cruda",
-                "Simulacion degradada",
-                "Costo cajas",
-                "Error crudo (%)",
-                "Error degradado (%)",
-            ],
-            fmt_subheader,
-        )
+    # Hoja Profit
+    ws_profit = wb.add_worksheet("Profit_Dia")
+    ws_profit.merge_range(0, 0, 0, 5, "Resumen Profit", fmt_header)
+    ws_profit.write_row(2, 0, ["Caso Base", "Simulacion cruda", "Simulacion degradada", "Costo cajas", "Error crudo (%)", "Error degradado (%)"], fmt_subheader)
+    if profit_df is not None and not profit_df.empty:
         row_vals = profit_df.iloc[0]
-        _write_number_safe(ws, start_row + 3, start_col, row_vals.get("case_base"), fmt_number)
-        _write_number_safe(ws, start_row + 3, start_col + 1, row_vals.get("sim_crudo"), fmt_number)
-        _write_number_safe(ws, start_row + 3, start_col + 2, row_vals.get("sim_degradado"), fmt_number)
-        _write_number_safe(ws, start_row + 3, start_col + 3, row_vals.get("costos_cajas"), fmt_number)
-        _write_number_safe(ws, start_row + 3, start_col + 4, row_vals.get("error_crudo_pct"), fmt_percent)
-        _write_number_safe(ws, start_row + 3, start_col + 5, row_vals.get("error_degradado_pct"), fmt_percent)
-        return start_row + 4
+        cols = ["case_base", "sim_crudo", "sim_degradado", "costos_cajas", "error_crudo_pct", "error_degradado_pct"]
+        for idx, col in enumerate(cols):
+            fmt = fmt_percent if "pct" in col else fmt_number
+            _write_number_safe(ws_profit, 3, idx, row_vals.get(col), fmt)
+    ws_profit.merge_range(6, 0, 6, 6, "Profit por tipo de dia", fmt_header)
+    ws_profit.write_row(8, 0, ["Tipo de dia", "Caso Base", "Simulacion cruda", "Simulacion degradada", "Costo cajas", "Error crudo (%)", "Error degradado (%)"], fmt_subheader)
+    for idx, row in profit_day_df.iterrows():
+        r = 9 + idx
+        ws_profit.write(r, 0, row.get("dia_tipo"), fmt_text)
+        _write_number_safe(ws_profit, r, 1, row.get("profit_clp_teo"), fmt_number)
+        _write_number_safe(ws_profit, r, 2, row.get("profit_clp_est"), fmt_number)
+        _write_number_safe(ws_profit, r, 3, row.get("profit_clp_degradado"), fmt_number)
+        _write_number_safe(ws_profit, r, 4, row.get("costo_cajas_clp"), fmt_number)
+        _write_number_safe(ws_profit, r, 5, row.get("profit_clp_rel_err_pct"), fmt_percent)
+        _write_number_safe(ws_profit, r, 6, row.get("profit_clp_degradado_rel_err_pct"), fmt_percent)
 
-    def write_profit_day_section(start_row: int, start_col: int) -> int:
-        ws.merge_range(start_row, start_col, start_row, start_col + 6, "PROFIT por tipo de dia", fmt_header_profit)
-        ws.write_row(
-            start_row + 2,
-            start_col,
+    # Hoja Wait
+    ws_wait = wb.add_worksheet("Wait_Dia_Perfil")
+    ws_wait.merge_range(0, 0, 0, 4, "Tiempo de espera por dia y perfil (s)", fmt_header)
+    ws_wait.write_row(2, 0, ["Tipo de dia", "Perfil", "Caso Base (s)", "Simulacion (s)", "Error (%)"], fmt_subheader)
+    for idx, row in wait_day_profile_df.iterrows():
+        ws_wait.write(3 + idx, 0, row.get("dia_tipo"), fmt_text)
+        ws_wait.write(3 + idx, 1, row.get("profile"), fmt_text)
+        _write_number_safe(ws_wait, 3 + idx, 2, row.get("wait_time_s_teo"), fmt_decimal)
+        _write_number_safe(ws_wait, 3 + idx, 3, row.get("wait_time_s_est"), fmt_decimal)
+        _write_number_safe(ws_wait, 3 + idx, 4, row.get("wait_time_s_rel_err_pct"), fmt_percent)
+
+    # Hoja Service Time
+    ws_service = wb.add_worksheet("Service_Time")
+    ws_service.merge_range(0, 0, 0, 4, "Tiempos de servicio por tipo de caja (s)", fmt_header)
+    ws_service.write_row(2, 0, ["Tipo caja", "Perfil", "Caso Base (s)", "Simulacion (s)", "Error (%)"], fmt_subheader)
+    for idx, row in service_time_df.iterrows():
+        ws_service.write(3 + idx, 0, row.get("lane_type"), fmt_text)
+        ws_service.write(3 + idx, 1, row.get("profile"), fmt_text)
+        _write_number_safe(ws_service, 3 + idx, 2, row.get("service_time_mean_teo"), fmt_decimal)
+        _write_number_safe(ws_service, 3 + idx, 3, row.get("service_time_mean_est"), fmt_decimal)
+        _write_number_safe(ws_service, 3 + idx, 4, row.get("service_time_mean_rel_err_pct"), fmt_percent)
+
+    if tac_df is not None and not tac_df.empty:
+        ws_tac_profile = wb.add_worksheet("TAC_Perfil")
+        ws_tac_profile.merge_range(0, 0, 0, 10, "TAC por perfil", fmt_header)
+        ws_tac_profile.write_row(
+            2,
+            0,
             [
-                "Tipo de dia",
-                "Caso Base",
-                "Simulacion cruda",
-                "Simulacion degradada",
-                "Costo cajas",
-                "Error crudo (%)",
-                "Error degradado (%)",
+                "Perfil",
+                "Served (sim %)",
+                "Served (teo %)",
+                "Error % served",
+                "Abandoned (sim %)",
+                "Abandoned (teo %)",
+                "Error % abandoned",
+                "Balked (sim %)",
+                "Balked (teo %)",
+                "Error % balked",
             ],
             fmt_subheader,
         )
-        for idx, row in profit_day_df.iterrows():
-            ws.write(start_row + 3 + idx, start_col, row.get("dia_tipo"), fmt_text)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 1, row.get("profit_clp_teo"), fmt_number)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 2, row.get("profit_clp_est"), fmt_number)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 3, row.get("profit_clp_degradado"), fmt_number)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 4, row.get("costo_cajas_clp"), fmt_number)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 5, row.get("profit_clp_rel_err_pct"), fmt_percent)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 6, row.get("profit_clp_degradado_rel_err_pct"), fmt_percent)
-        return start_row + 3 + len(profit_day_df)
+        for idx, row in tac_df.iterrows():
+            ws_tac_profile.write(3 + idx, 0, row.get("profile"), fmt_text)
+            served_est = row.get("served_pct_est", row.get("served_pct"))
+            aband_est = row.get("abandoned_pct_est", row.get("abandoned_pct"))
+            balked_est = row.get("balked_pct_est", row.get("balked_pct"))
+            _write_number_safe(ws_tac_profile, 3 + idx, 1, served_est, fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 2, row.get("served_pct_teo"), fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 3, row.get("served_pct_rel_err_pct"), fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 4, aband_est, fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 5, row.get("abandoned_pct_teo"), fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 6, row.get("abandoned_pct_rel_err_pct"), fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 7, balked_est, fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 8, row.get("balked_pct_teo"), fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 9, row.get("balked_pct_rel_err_pct"), fmt_percent)
+        counts_start = 4 + len(tac_df)
+        if client_counts_df is not None and not client_counts_df.empty:
+            ws_tac_profile.merge_range(counts_start, 0, counts_start, 6, "Conteo por perfil y tipo de dia", fmt_header)
+            ws_tac_profile.write_row(
+                counts_start + 2,
+                0,
+                [
+                    "Tipo de dia",
+                    "Perfil",
+                    "Served (sim)",
+                    "Served (teo)",
+                    "Error % served",
+                    "Abandoned (sim)",
+                    "Abandoned (teo)",
+                    "Error % abandoned",
+                    "Balked (sim)",
+                    "Balked (teo)",
+                    "Error % balked",
+                ],
+                fmt_subheader,
+            )
+            for idx, row in client_counts_df.iterrows():
+                r = counts_start + 3 + idx
+                ws_tac_profile.write(r, 0, row.get("dia_tipo"), fmt_text)
+                ws_tac_profile.write(r, 1, row.get("profile"), fmt_text)
+                _write_number_safe(ws_tac_profile, r, 2, row.get("served_est"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 3, row.get("served_teo"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 4, row.get("served_rel_err_pct"), fmt_percent)
+                _write_number_safe(ws_tac_profile, r, 5, row.get("abandoned_est"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 6, row.get("abandoned_teo"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 7, row.get("abandoned_rel_err_pct"), fmt_percent)
+                _write_number_safe(ws_tac_profile, r, 8, row.get("balked_est"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 9, row.get("balked_teo"), fmt_number)
+                _write_number_safe(ws_tac_profile, r, 10, row.get("balked_rel_err_pct"), fmt_percent)
 
-    def write_kpi_table(data: pd.DataFrame, start_row: int, start_col: int, title: str, header_fmt, subheader_fmt) -> int:
-        ws.merge_range(start_row, start_col, start_row, start_col + 3, title, header_fmt)
-        ws.write_row(
-            start_row + 2,
-            start_col,
-            ["Perfil", "Caso Base", "Simulacion", "Error Porcentual"],
-            subheader_fmt,
-        )
-        for idx, (_, row) in enumerate(data.iterrows()):
-            ws.write(start_row + 3 + idx, start_col, row.get("profile"), fmt_text)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 1, row.get("base"), fmt_decimal)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 2, row.get("sim"), fmt_decimal)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 3, row.get("error_pct"), fmt_percent)
-
-        return start_row + 3 + len(data)
-
-    def write_service_time_section(start_row: int, start_col: int) -> int:
-        ws.merge_range(
-            start_row,
-            start_col,
-            start_row,
-            start_col + 4,
-            "Tiempos de servicio por tipo de caja (s)",
-            fmt_header_service,
-        )
-        ws.write_row(
-            start_row + 2,
-            start_col,
-            ["Tipo caja", "Perfil", "Caso Base (s)", "Simulacion (s)", "Error Porcentual"],
-            fmt_subheader_service,
-        )
-        for idx, row in service_time_df.iterrows():
-            ws.write(start_row + 3 + idx, start_col, row.get("lane_type"), fmt_text)
-            ws.write(start_row + 3 + idx, start_col + 1, row.get("profile"), fmt_text)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 2, row.get("service_time_mean_teo"), fmt_decimal)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 3, row.get("service_time_mean_est"), fmt_decimal)
-            _write_number_safe(ws, start_row + 3 + idx, start_col + 4, row.get("service_time_mean_rel_err_pct"), fmt_percent)
-        return start_row + 3 + len(service_time_df)
-
-    next_row = write_profit_section(2, 1) + 2
-    next_row = write_profit_day_section(next_row, 1) + 2
-
-    tac_rows = tac_df[["profile", "served_pct_teo", "served_pct_est", "served_pct_rel_err_pct"]].rename(
-        columns={
-            "served_pct_teo": "base",
-            "served_pct_est": "sim",
-            "served_pct_rel_err_pct": "error_pct",
-        }
+    ws_tac_lane = wb.add_worksheet("TAC_Perfil_Caja")
+    ws_tac_lane.merge_range(0, 0, 0, 10, "TAC por perfil y tipo de caja", fmt_header)
+    ws_tac_lane.write_row(
+        2,
+        0,
+        [
+            "Tipo caja",
+            "Perfil",
+            "Served (sim %)",
+            "Served (teo %)",
+            "Error % served",
+            "Abandoned (sim %)",
+            "Abandoned (teo %)",
+            "Error % abandoned",
+            "Balked (sim %)",
+            "Balked (teo %)",
+            "Error % balked",
+        ],
+        fmt_subheader,
     )
-    next_row = write_kpi_table(tac_rows, next_row, 1, "TAC - Tasa abandono", fmt_header_tac, fmt_subheader_green) + 2
+    for idx, row in tac_lane_df.iterrows():
+        ws_tac_lane.write(3 + idx, 0, row.get("lane_type"), fmt_text)
+        ws_tac_lane.write(3 + idx, 1, row.get("profile"), fmt_text)
+        _write_number_safe(ws_tac_lane, 3 + idx, 2, row.get("served_pct_est"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 3, row.get("served_pct_teo"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 4, row.get("served_pct_rel_err_pct"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 5, row.get("abandoned_pct_est"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 6, row.get("abandoned_pct_teo"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 7, row.get("abandoned_pct_rel_err_pct"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 8, row.get("balked_pct_est"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 9, row.get("balked_pct_teo"), fmt_percent)
+        _write_number_safe(ws_tac_lane, 3 + idx, 10, row.get("balked_pct_rel_err_pct"), fmt_percent)
 
-    tmc_rows = tmc_df[["profile", "tmc_wait_time_s_teo", "tmc_wait_time_s_est", "tmc_wait_time_s_rel_err_pct"]].rename(
-        columns={
-            "tmc_wait_time_s_teo": "base",
-            "tmc_wait_time_s_est": "sim",
-            "tmc_wait_time_s_rel_err_pct": "error_pct",
-        }
-    )
-    write_kpi_table(tmc_rows, 2, 9, "TMC - Tiempo medio de espera (s)", fmt_header_tmc, fmt_subheader_pink)
-    service_end_row = write_service_time_section(12, 9)
-    hv_start_row = service_end_row + 2
+    if tmc_df is not None and not tmc_df.empty:
+        ws_tmc = wb.add_worksheet("TMC_Perfil")
+        ws_tmc.merge_range(0, 0, 0, 4, "TMC por perfil", fmt_header)
+        ws_tmc.write_row(2, 0, ["Perfil", "Caso Base (s)", "Simulacion (s)", "Error (%)"], fmt_subheader)
+        for idx, row in tmc_df.iterrows():
+            ws_tmc.write(3 + idx, 0, row.get("profile"), fmt_text)
+            teo_val = row.get("tmc_wait_time_s_teo")
+            est_val = row.get("tmc_wait_time_s_est", row.get("tmc_wait_time_s"))
+            err_val = row.get("tmc_wait_time_s_rel_err_pct")
+            _write_number_safe(ws_tmc, 3 + idx, 1, teo_val, fmt_decimal)
+            _write_number_safe(ws_tmc, 3 + idx, 2, est_val, fmt_decimal)
+            _write_number_safe(ws_tmc, 3 + idx, 3, err_val, fmt_percent)
 
-    hv_rows = hv_df[["profile", "tac_hv_pct_teo", "tac_hv_pct_est", "tac_hv_pct_rel_err_pct"]].rename(
-        columns={
-            "tac_hv_pct_teo": "base",
-            "tac_hv_pct_est": "sim",
-            "tac_hv_pct_rel_err_pct": "error_pct",
-        }
-    )
-    write_kpi_table(hv_rows, hv_start_row, 9, "TAC_HV - Tasa abandono alto volumen", fmt_header_hv, fmt_subheader_pink)
+    if hv_df is not None and not hv_df.empty:
+        ws_hv = wb.add_worksheet("TAC_Alto_Vol")
+        ws_hv.merge_range(0, 0, 0, 4, "TAC alto volumen", fmt_header)
+        ws_hv.write_row(2, 0, ["Perfil", "TAC HV (sim %)", "TAC HV (teo %)", "Error %"], fmt_subheader)
+        for idx, row in hv_df.iterrows():
+            ws_hv.write(3 + idx, 0, row.get("profile"), fmt_text)
+            _write_number_safe(ws_hv, 3 + idx, 1, row.get("tac_hv_pct_est"), fmt_percent)
+            _write_number_safe(ws_hv, 3 + idx, 2, row.get("tac_hv_pct_teo"), fmt_percent)
+            _write_number_safe(ws_hv, 3 + idx, 3, row.get("tac_hv_pct_rel_err_pct"), fmt_percent)
 
     if client_counts_df is not None and not client_counts_df.empty:
         ws_clients = wb.add_worksheet("Clientes")
-        ws_clients.merge_range(0, 0, 0, 10, "Clientes por perfil y tipo de dia", fmt_header_service)
+        ws_clients.merge_range(0, 0, 0, 10, "Clientes por perfil y tipo de dia", fmt_header)
         ws_clients.write_row(
             2,
             0,
@@ -339,7 +383,7 @@ def export_formatted_excel_report(
                 "Balked (teo)",
                 "Error % balked",
             ],
-            fmt_subheader_service,
+            fmt_subheader,
         )
         for idx, row in client_counts_df.iterrows():
             r = 3 + idx
@@ -357,7 +401,7 @@ def export_formatted_excel_report(
 
     if little_df is not None and not little_df.empty:
         ws_little = wb.add_worksheet("Little")
-        ws_little.merge_range(0, 0, 0, 11, "Ley de Little (lambda*W vs L)", fmt_header_service)
+        ws_little.merge_range(0, 0, 0, 11, "Ley de Little (lambda*W vs L)", fmt_header)
         ws_little.write_row(
             2,
             0,
@@ -376,7 +420,7 @@ def export_formatted_excel_report(
                 "L = λW teo",
                 "Error % L",
             ],
-            fmt_subheader_service,
+            fmt_subheader,
         )
         for idx, row in little_df.iterrows():
             r = 3 + idx
@@ -526,6 +570,67 @@ def run_full_workflow(
     
     # 3) TAC_p (tasa de abandono/balk por perfil, estimada a partir de la muestra)
     status_cols = ["served", "abandoned", "balked"]
+
+    def _summarize_client_status(data: pd.DataFrame) -> pd.DataFrame:
+        subset = data[data["outcome_norm"].isin(status_cols)].copy()
+        if subset.empty:
+            return pd.DataFrame()
+        grouped = (
+            subset.groupby(["dia_tipo_norm", "profile", "outcome_norm"])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+        for col in status_cols:
+            if col not in grouped.columns:
+                grouped[col] = 0
+        grouped = grouped.rename(columns={"dia_tipo_norm": "dia_tipo"})
+        return grouped
+
+    def _build_wait_day_profile_summary(data: pd.DataFrame) -> pd.DataFrame:
+        served = data[data["outcome_norm"] == "served"].copy()
+        if served.empty:
+            return pd.DataFrame()
+        grouped = (
+            served.groupby(["dia_tipo_norm", "profile"])["wait_time_s"]
+            .mean()
+            .reset_index(name="wait_time_s")
+        )
+        grouped["dia_tipo"] = grouped["dia_tipo_norm"]
+        return grouped[["dia_tipo", "profile", "wait_time_s"]]
+
+    def _build_tac_lane_summary(data: pd.DataFrame) -> pd.DataFrame:
+        subset = data[data["outcome_norm"].isin(status_cols)].copy()
+        if subset.empty:
+            return pd.DataFrame()
+        subset["lane_type_norm"] = (
+            subset["lane_type"]
+            .astype(str)
+            .str.lower()
+            .map(engine.LANE_NAME_NORMALIZATION)
+            .fillna(subset["lane_type"])
+        )
+        grouped = (
+            subset.groupby(["lane_type_norm", "profile", "outcome_norm"])
+            .size()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+        for col in status_cols:
+            if col not in grouped.columns:
+                grouped[col] = 0
+        grouped["total"] = grouped[status_cols].sum(axis=1)
+        for col in status_cols:
+            pct_col = f"{col}_pct"
+            grouped[pct_col] = np.where(
+                grouped["total"] > 0,
+                grouped.get(col, 0) / grouped["total"] * 100.0,
+                np.nan,
+            )
+        grouped = grouped.rename(columns={"lane_type_norm": "lane_type"})
+        cols = ["lane_type", "profile"] + [f"{c}_pct" for c in status_cols]
+        return grouped[cols]
+
     status_df = df[df["outcome_norm"].isin(status_cols)].copy()
     counts = status_df.groupby(["profile", "outcome_norm"]).size().unstack(fill_value=0)
     counts["total"] = counts.sum(axis=1)
@@ -571,14 +676,19 @@ def run_full_workflow(
         df.loc[df["outcome_norm"] == "served"]
           .groupby(["lane_type", "profile"])["service_time_s"]
           .mean()
-          .reset_index(name="service_time_mean_sim_s")
+          .reset_index(name="service_time_mean_est")
     )
     service_time_sim["lane_type"] = (
         service_time_sim["lane_type"].astype(str).str.lower().map(engine.LANE_NAME_NORMALIZATION).fillna(service_time_sim["lane_type"])
     )
     service_time_display = service_time_sim.copy()
     service_time_title = "Tiempos de servicio por tipo de caja (estimado)"
-    service_time_formatted = None
+    service_time_formatted = service_time_sim.copy()
+    service_time_formatted["service_time_mean_teo"] = np.nan
+    service_time_formatted["service_time_mean_rel_err_pct"] = np.nan
+    service_time_formatted = service_time_formatted[
+        ["lane_type", "profile", "service_time_mean_teo", "service_time_mean_est", "service_time_mean_rel_err_pct"]
+    ]
     
     # 6) KPIs segmentados por tipo de dia
     df["dia_tipo_norm"] = (
@@ -728,7 +838,7 @@ def run_full_workflow(
             service_time_teo["lane_type"].astype(str).str.lower().map(engine.LANE_NAME_NORMALIZATION).fillna(service_time_teo["lane_type"])
         )
         if not service_time_teo.empty:
-            service_time_est = service_time_sim.rename(columns={"service_time_mean_sim_s": "service_time_mean"})
+            service_time_est = service_time_sim.rename(columns={"service_time_mean_est": "service_time_mean"})
             service_time_base = service_time_teo.rename(columns={"service_time_mean_teo_s": "service_time_mean"})
             service_time_cmp = _compare_kpi_tables(
                 service_time_est,
@@ -739,13 +849,15 @@ def run_full_workflow(
             )
             if service_time_cmp is not None:
                 service_time_display = service_time_cmp
-                service_time_formatted = service_time_cmp.rename(
-                    columns={
-                        "service_time_mean_est": "service_time_mean_est",
-                        "service_time_mean_teo": "service_time_mean_teo",
-                        "service_time_mean_rel_err_pct": "service_time_mean_rel_err_pct",
-                    }
-                )
+                service_time_formatted = service_time_cmp[
+                    [
+                        "lane_type",
+                        "profile",
+                        "service_time_mean_teo",
+                        "service_time_mean_est",
+                        "service_time_mean_rel_err_pct",
+                    ]
+                ]
                 service_time_title = "Tiempos de servicio por tipo de caja (estimado vs teorico)"
     
         kpi_day_teo_rows: list[dict[str, float]] = []
@@ -817,22 +929,6 @@ def run_full_workflow(
         if kpi_day_cmp is not None:
             kpi_day_display = kpi_day_cmp
             kpi_day_title = "KPIs por tipo de dia (estimado vs teorico)"
-
-        def _summarize_client_status(data: pd.DataFrame) -> pd.DataFrame:
-            subset = data[data["outcome_norm"].isin(status_cols)].copy()
-            if subset.empty:
-                return pd.DataFrame()
-            grouped = (
-                subset.groupby(["dia_tipo_norm", "profile", "outcome_norm"])
-                .size()
-                .unstack(fill_value=0)
-                .reset_index()
-            )
-            for col in status_cols:
-                if col not in grouped.columns:
-                    grouped[col] = 0
-            grouped = grouped.rename(columns={"dia_tipo_norm": "dia_tipo"})
-            return grouped
 
         client_counts_df = None
         est_counts = _summarize_client_status(df)
@@ -921,6 +1017,59 @@ def run_full_workflow(
     else:
         client_counts_df = None
         little_summary_df = None
+
+    wait_day_profile_df = None
+    wait_est = _build_wait_day_profile_summary(df)
+    if not wait_est.empty:
+        wait_day_profile_df = wait_est.rename(columns={"wait_time_s": "wait_time_s_est"})
+        if df_teo is not None:
+            wait_teo = _build_wait_day_profile_summary(df_teo)
+        else:
+            wait_teo = pd.DataFrame()
+        if not wait_teo.empty:
+            wait_day_profile_df = wait_day_profile_df.merge(
+                wait_teo.rename(columns={"wait_time_s": "wait_time_s_teo"}),
+                on=["dia_tipo", "profile"],
+                how="left",
+            )
+        else:
+            wait_day_profile_df["wait_time_s_teo"] = np.nan
+        wait_day_profile_df["wait_time_s_rel_err_pct"] = np.where(
+            wait_day_profile_df["wait_time_s_teo"] != 0,
+            (wait_day_profile_df["wait_time_s_est"] - wait_day_profile_df["wait_time_s_teo"])
+            / wait_day_profile_df["wait_time_s_teo"]
+            * 100.0,
+            np.nan,
+        )
+
+    tac_lane_formatted = None
+    lane_est = _build_tac_lane_summary(df)
+    if not lane_est.empty:
+        tac_lane_formatted = lane_est.rename(
+            columns={f"{col}_pct": f"{col}_pct_est" for col in status_cols}
+        )
+        if df_teo is not None:
+            lane_teo = _build_tac_lane_summary(df_teo)
+        else:
+            lane_teo = pd.DataFrame()
+        if not lane_teo.empty:
+            tac_lane_formatted = tac_lane_formatted.merge(
+                lane_teo.rename(columns={f"{col}_pct": f"{col}_pct_teo" for col in status_cols}),
+                on=["lane_type", "profile"],
+                how="left",
+            )
+        else:
+            for col in status_cols:
+                tac_lane_formatted[f"{col}_pct_teo"] = np.nan
+        for col in status_cols:
+            est_col = f"{col}_pct_est"
+            teo_col = f"{col}_pct_teo"
+            err_col = f"{col}_pct_rel_err_pct"
+            tac_lane_formatted[err_col] = np.where(
+                tac_lane_formatted[teo_col] != 0,
+                (tac_lane_formatted[est_col] - tac_lane_formatted[teo_col]) / tac_lane_formatted[teo_col] * 100.0,
+                np.nan,
+            )
     
     print(f"\n{profit_day_title}")
     display(profit_day_display)
@@ -957,15 +1106,17 @@ def run_full_workflow(
     if export_path:
         print(f"\nKPIs exportados a {export_path}")
     formatted_path = export_formatted_excel_report(
-        resultados_root,
-        profit_compare_df,
-        profit_day_display,
-        tac_display,
-        tmc_display,
-        hv_formatted_df,
-        service_time_formatted,
-        client_counts_df,
-        little_summary_df,
+        export_root=resultados_root,
+        profit_df=profit_compare_df,
+        profit_day_df=profit_day_display,
+        wait_day_profile_df=wait_day_profile_df,
+        service_time_df=service_time_formatted,
+        tac_lane_df=tac_lane_formatted,
+        tac_df=tac_display,
+        tmc_df=tmc_display,
+        hv_df=hv_formatted_df,
+        client_counts_df=client_counts_df,
+        little_df=little_summary_df,
     )
     if formatted_path:
         print(f"Reporte formateado exportado a {formatted_path}")

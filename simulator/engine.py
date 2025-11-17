@@ -32,6 +32,27 @@ OPEN_S  = 8 * 3600
 CLOSE_S = 22 * 3600
 BIN_SEC = 1
 
+_ANNOUNCED_FILES: set[Path] = set()
+
+
+def _info(message: str, path: Optional[Path] = None) -> None:
+    target = f"{path}" if path is not None else ""
+    suffix = f": {target}" if target else ""
+    print(f"[INFO] {message}{suffix}")
+
+
+def _warn(message: str, path: Optional[Path] = None) -> None:
+    target = f"{path}" if path is not None else ""
+    suffix = f": {target}" if target else ""
+    print(f"[WARN] {message}{suffix}")
+
+
+def _announce_once(label: str, path: Path) -> None:
+    if path in _ANNOUNCED_FILES:
+        return
+    _ANNOUNCED_FILES.add(path)
+    _info(label, path)
+
 # %%
 # Clases base
 class CustomerProfile(Enum):
@@ -83,12 +104,15 @@ _SERVICE_TIME_MULTIPLIERS = {}
 
 
 def _load_service_time_multipliers(path: Path) -> dict[tuple[str, str], float]:
+    path = Path(path)
     if not path.exists():
+        _warn("No se encontro archivo de multiplicadores de servicio, se usara valor base", path)
         return {}
     try:
+        _announce_once("Cargando multiplicadores de servicio", path)
         df = pd.read_csv(path)
     except Exception as exc:
-        print(f"[WARN] No se pudieron cargar los multiplicadores de servicio ({exc})")
+        _warn(f"No se pudieron cargar los multiplicadores de servicio ({exc})", path)
         return {}
     required = {"lane_type", "profile", "multiplier"}
     if not required.issubset(df.columns):
@@ -111,6 +135,7 @@ def _load_service_time_multipliers(path: Path) -> dict[tuple[str, str], float]:
 
 _SERVICE_TIME_MULTIPLIERS = _load_service_time_multipliers(SERVICE_TIME_MULTIPLIERS_PATH)
 PATIENCE_DISTRIBUTION_FILE = PROJECT_ROOT / "patience/patience_distribution_profile_priority_payment_day.csv"
+PATIENCE_BASE_CSV_FILE = PATIENCE_DISTRIBUTION_FILE
 _PATIENCE_TABLE_ANNOUNCED = False
 DEFAULT_LANE_COUNTS = {
     DayType.TYPE_1: {"regular": 10, "express": 3, "priority": 2, "self_checkout": 5},
@@ -226,31 +251,39 @@ def _normalize_lane_type_name(name: str) -> Optional[LaneType]:
 
 
 def _load_lane_cost_specs(path: Path = LANE_COSTS_FILE) -> dict[LaneType, LaneCostSpec]:
+    path = Path(path)
     if not path.exists():
+        _warn("No se encontro costos_cajas.csv; se asumira costo cero", path)
         return {}
     specs: dict[LaneType, LaneCostSpec] = {}
-    with path.open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            lt = _normalize_lane_type_name(row.get("lane_type"))
-            if lt is None:
-                continue
-            try:
-                capex = float(row.get("capex_clp", 0))
-                maintenance = float(row.get("maintenance_clp_per_year", 0))
-                opex = float(row.get("opex_clp_per_hour", 0))
-                wage_total = float(row.get("wage_total_clp_per_hour") or row.get("wage_clp_per_hour") or 0)
-                useful_life = float(row.get("useful_life_years", 1))
-            except (TypeError, ValueError):
-                continue
-            specs[lt] = LaneCostSpec(
-                lane_type=lt,
-                capex_clp=capex,
-                maintenance_clp_per_year=maintenance,
-                opex_clp_per_hour=opex,
-                wage_total_clp_per_hour=wage_total,
-                useful_life_years=useful_life,
-            )
+    try:
+        with path.open(newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                lt = _normalize_lane_type_name(row.get("lane_type"))
+                if lt is None:
+                    continue
+                try:
+                    capex = float(row.get("capex_clp", 0))
+                    maintenance = float(row.get("maintenance_clp_per_year", 0))
+                    opex = float(row.get("opex_clp_per_hour", 0))
+                    wage_total = float(row.get("wage_total_clp_per_hour") or row.get("wage_clp_per_hour") or 0)
+                    useful_life = float(row.get("useful_life_years", 1))
+                except (TypeError, ValueError):
+                    continue
+                specs[lt] = LaneCostSpec(
+                    lane_type=lt,
+                    capex_clp=capex,
+                    maintenance_clp_per_year=maintenance,
+                    opex_clp_per_hour=opex,
+                    wage_total_clp_per_hour=wage_total,
+                    useful_life_years=useful_life,
+                )
+    except Exception as exc:
+        _warn(f"No se pudieron leer costos de cajas ({exc})", path)
+        return {}
+    if specs:
+        _announce_once("Cargando costos de infraestructura desde CSV", path)
     return specs
 
 
@@ -335,6 +368,7 @@ _PRIORITY_MAP = {
 _PAYMENT_MAP = {PaymentMethod.CARD:"card", PaymentMethod.CASH:"cash"}
 
 _SERIES_CACHE: Dict[CustomerProfile, Dict[Tuple[DayType,PriorityType,PaymentMethod], Tuple[np.ndarray,np.ndarray]]] = {}
+_ARRIVAL_ANNOUNCED: set[Path] = set()
 
 
 def _load_arrival_series(path: Path) -> dict[tuple[DayType, PriorityType, PaymentMethod], tuple[np.ndarray, np.ndarray]]:
@@ -362,6 +396,9 @@ def _get_series_for_profile(profile: CustomerProfile):
     path = _ARRIVAL_FILES.get(profile)
     if path is None or not path.exists():
         raise FileNotFoundError(f"Archivo de llegadas no encontrado para {profile.value}: {path}")
+    if path not in _ARRIVAL_ANNOUNCED:
+        _announce_once(f"Cargando llegadas para perfil {profile.value}", path)
+        _ARRIVAL_ANNOUNCED.add(path)
     series = _load_arrival_series(path)
     _SERIES_CACHE[profile] = series
     return series
@@ -792,9 +829,13 @@ def _row_to_spec(row: Dict[str,Any]) -> Dict[str,Any]:
     val = _fget(row,"fixed","value","median","mode", default=300.0)
     return {"method":"fixed","value":float(val)}
 
-def _load_patience_rules_from_csv(path: str) -> _PatienceRuleStore:
+def _load_patience_rules_from_csv(path: str | Path) -> _PatienceRuleStore:
     store = _PatienceRuleStore()
-    with open(path, "r", encoding="utf-8") as f:
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"No se encuentra {path_obj}")
+    _announce_once("Cargando distribuciones de paciencia (CSV)", path_obj)
+    with open(path_obj, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -831,7 +872,7 @@ class PatienceDistributionExponential:
 
 @dataclass
 class PatienceDistributionCSV:
-    source_file: str = "patience_distributions_full.csv"
+    source_file: Path = PATIENCE_BASE_CSV_FILE
     _store: _PatienceRuleStore = None
     def __post_init__(self):
         self._store = _load_patience_rules_from_csv(self.source_file)
@@ -1009,17 +1050,23 @@ class PatienceDistributionTable:
 def _build_patience_sampler():
     try:
         base_fallback = PatienceDistributionCSV()
+        base_csv_path = Path(base_fallback.source_file)
+        if base_csv_path.exists():
+            _announce_once("Usando CSV base de paciencia", base_csv_path)
     except FileNotFoundError:
+        _warn("No se encontro el CSV base de paciencia; se usara exponencial por defecto")
         base_fallback = PatienceDistributionExponential()
     if PATIENCE_DISTRIBUTION_FILE.exists():
         try:
             global _PATIENCE_TABLE_ANNOUNCED
             if not _PATIENCE_TABLE_ANNOUNCED:
-                print("[INFO] Usando distribuciones de paciencia desde", PATIENCE_DISTRIBUTION_FILE)
+                _announce_once("Usando distribuciones de paciencia reconstruidas", PATIENCE_DISTRIBUTION_FILE)
                 _PATIENCE_TABLE_ANNOUNCED = True
             return PatienceDistributionTable(PATIENCE_DISTRIBUTION_FILE, fallback=base_fallback)
         except Exception as exc:
-            print(f"[WARN] No se pudo cargar el archivo de paciencia ({exc}); se usara el CSV tradicional.")
+            _warn(f"No se pudo cargar el archivo de paciencia; se usara el CSV tradicional ({exc})", PATIENCE_DISTRIBUTION_FILE)
+    else:
+        _warn("Archivo de paciencia reconstruido no encontrado, se usara el CSV tradicional", PATIENCE_DISTRIBUTION_FILE)
     return base_fallback
 
 @dataclass
@@ -1090,6 +1137,10 @@ EXPRESS_PROFILE_WEIGHT = {
     CustomerProfile.SELF_CHECKOUT_FAN: 0.4,
 }
 DEFAULT_EXPRESS_WEIGHT = 0.3
+SLOW_PROFILES = {
+    CustomerProfile.FAMILY_CART,
+    CustomerProfile.WEEKLY_PLANNER,
+}
 
 # %%
 _DIST = {
@@ -1336,8 +1387,13 @@ if SERVICE_TIME_MODEL_JSON.exists():
             SERVICE_TIME_MODEL_JSON,
             multipliers=_SERVICE_TIME_MULTIPLIERS,
         )
+        _announce_once("Modelo de tiempos de servicio cargado", SERVICE_TIME_MODEL_JSON)
     except Exception as exc:
-        print(f"[WARN] No se pudo cargar {SERVICE_TIME_MODEL_JSON.name}: {exc}")
+        _warn(f"No se pudo cargar {SERVICE_TIME_MODEL_JSON.name}: {exc}")
+        SERVICE_TIME_MODEL = None
+else:
+    _warn("No existe modelo de tiempos de servicio; se usara configuracion por defecto", SERVICE_TIME_MODEL_JSON)
+    SERVICE_TIME_MODEL = None
 
 
 # %% [markdown]
@@ -1434,9 +1490,12 @@ def _safe_float(value, default=np.nan):
         return default
 
 
-def _load_profit_betas(csv_path: str) -> dict:
+def _load_profit_betas(csv_path: str | Path) -> dict:
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"No se encontro archivo de profit: {path}")
     data: dict[tuple[str, str, str, DayType], dict] = {}
-    with open(csv_path, newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
             profile = row.get("profile", "").strip()
@@ -1464,6 +1523,7 @@ def _load_profit_betas(csv_path: str) -> dict:
                 data[(profile, priority, "", day_label)] = entry
     if not data:
         raise RuntimeError("No se pudieron cargar betas desde profit_analysis_summary.csv")
+    _announce_once("Cargando betas de profit", path)
     return data
 
 
@@ -1610,11 +1670,18 @@ def _norm_generic(value) -> str:
     return str(value).strip().lower()
 
 
-def _load_balking_thresholds(path: Path) -> dict[tuple[str, str, str, str], float]:
+def _load_balking_thresholds(path: Path) -> dict[tuple[str, str, str, str, str], float]:
+    path = Path(path)
     if not path.exists():
+        _warn("No se encontro archivo de umbrales de balking; se usara sin limites teoricos", path)
         return {}
-    df = pd.read_csv(path)
-    thresholds: dict[tuple[str, str, str, str], float] = {}
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        _warn(f"No se pudieron leer umbrales de balking ({exc})", path)
+        return {}
+    _announce_once("Cargando umbrales de balking", path)
+    thresholds: dict[tuple[str, str, str, str, str], float] = {}
     for row in df.itertuples(index=False):
         limit = getattr(row, "estimated_threshold", None)
         if pd.isna(limit):
@@ -1624,12 +1691,41 @@ def _load_balking_thresholds(path: Path) -> dict[tuple[str, str, str, str], floa
             _norm_generic(getattr(row, "priority", "")),
             _norm_generic(getattr(row, "payment_method", "")),
             _norm_generic(getattr(row, "day_type", "")),
+            _norm_generic(getattr(row, "lane_type", "")),
         )
         thresholds[key] = float(limit)
     return thresholds
 
 
+BALKING_DAYTYPE_FACTORS_FILE = PROJECT_ROOT / "balking/balking_daytype_factors.csv"
+
+
+def _load_balking_daytype_factors(path: Path) -> dict[str, float]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        _warn(f"No se pudieron leer factores por tipo de dia ({exc})", path)
+        return {}
+    factors: dict[str, float] = {}
+    for row in df.itertuples(index=False):
+        day = _norm_generic(getattr(row, "day_type", ""))
+        try:
+            factor = float(getattr(row, "multiplier", 1.0))
+        except (TypeError, ValueError):
+            continue
+        if not day:
+            continue
+        factors[day] = max(0.0, factor)
+    if factors:
+        _announce_once("Factores de balking por tipo de dia cargados", path)
+    return factors
+
+
 BALKING_THRESHOLDS = _load_balking_thresholds(PROJECT_ROOT / "balking/balking_thresholds.csv")
+BALKING_DAYTYPE_FACTORS = _load_balking_daytype_factors(BALKING_DAYTYPE_FACTORS_FILE)
 
 
 def lookup_balking_threshold(
@@ -1637,6 +1733,7 @@ def lookup_balking_threshold(
     priority,
     payment_method,
     day_type,
+    lane_type,
 ) -> Optional[float]:
     if not BALKING_THRESHOLDS:
         return None
@@ -1644,15 +1741,28 @@ def lookup_balking_threshold(
     prio = _norm_generic(priority)
     pay = _norm_generic(payment_method)
     day = _norm_generic(day_type)
-    keys = [
-        (prof, prio, pay, day),
-        (prof, prio, pay, ""),
-        (prof, prio, "", ""),
-        (prof, "", "", ""),
-    ]
+    lane = _norm_generic(lane_type)
+    lane_candidates = []
+    if lane:
+        lane_candidates.extend([lane, ""])
+    else:
+        lane_candidates.append("")
+    keys: list[tuple[str, str, str, str, str]] = []
+    for lane_opt in lane_candidates:
+        keys.extend(
+            [
+                (prof, prio, pay, day, lane_opt),
+                (prof, prio, pay, "", lane_opt),
+                (prof, prio, "", "", lane_opt),
+                (prof, "", "", "", lane_opt),
+            ]
+        )
     for key in keys:
         limit = BALKING_THRESHOLDS.get(key)
         if limit is not None:
+            if day:
+                factor = BALKING_DAYTYPE_FACTORS.get(day, 1.0)
+                return float(limit) * float(factor or 1.0)
             return limit
     return None
 
@@ -1764,10 +1874,19 @@ def spawn_customer(env, lanes, cliente, time_log, customers_rows,
     def _pick_random(lanes: list[CheckoutLane]) -> CheckoutLane:
         if len(lanes) == 1:
             return lanes[0]
+        slow_profile = cliente["profile"] in SLOW_PROFILES
         express = [ln for ln in lanes if ln.lane_type is LaneType.EXPRESS]
         others = [ln for ln in lanes if ln.lane_type is not LaneType.EXPRESS]
+        if slow_profile:
+            preferred = [
+                ln for ln in others if ln.lane_type in (LaneType.REGULAR, LaneType.PRIORITY)
+            ]
+            if preferred:
+                return preferred[np.random.randint(len(preferred))]
         if express:
             weight = EXPRESS_PROFILE_WEIGHT.get(cliente["profile"], DEFAULT_EXPRESS_WEIGHT)
+            if slow_profile:
+                weight = min(weight, 0.05)
             if np.random.random() < weight:
                 return express[np.random.randint(len(express))]
             if others:
@@ -1825,6 +1944,7 @@ def spawn_customer(env, lanes, cliente, time_log, customers_rows,
         cliente["priority"],
         cliente["payment_method"],
         day_type_value,
+        lane.lane_type,
     )
     if threshold is not None and eff_q_len > threshold:
         _registrar_balk("queue_threshold")

@@ -94,23 +94,33 @@ def compute_kde(values: np.ndarray, grid_size: int = 256, bandwidth: str | float
     return grid, density
 
 
-def fit_parametric_distribution(values: np.ndarray) -> dict | None:
+PARAMETRIC_DISTRIBUTIONS = {
+    "exponential": {"dist": stats.expon, "fit_kwargs": {"floc": 0}},
+    "gamma": {"dist": stats.gamma, "fit_kwargs": {"floc": 0}},
+    "lognorm": {"dist": stats.lognorm, "fit_kwargs": {"floc": 0}},
+    "weibull_min": {"dist": stats.weibull_min, "fit_kwargs": {"floc": 0}},
+    "invgauss": {"dist": stats.invgauss, "fit_kwargs": {"floc": 0}},
+    "genpareto": {"dist": stats.genpareto, "fit_kwargs": {"floc": 0}},
+    "norm": {"dist": stats.norm, "fit_kwargs": {}},
+}
+
+
+def fit_parametric_distribution(values: np.ndarray, allowed: set[str] | None = None) -> dict | None:
     data = np.asarray(values, dtype=float)
     data = data[np.isfinite(data) & (data > 0)]
     if data.size == 0:
         return None
-    candidates = {
-        "exponential": lambda x: stats.expon.fit(x, floc=0),
-        "gamma": lambda x: stats.gamma.fit(x, floc=0),
-        "lognorm": lambda x: stats.lognorm.fit(x, floc=0),
-        "weibull_min": lambda x: stats.weibull_min.fit(x, floc=0),
-        "norm": lambda x: stats.norm.fit(x),
-    }
+    if allowed:
+        candidates = {name: PARAMETRIC_DISTRIBUTIONS[name] for name in PARAMETRIC_DISTRIBUTIONS if name in allowed}
+    else:
+        candidates = PARAMETRIC_DISTRIBUTIONS
     best = None
-    for name, fit_func in candidates.items():
+    n = data.size
+    for name, spec in candidates.items():
+        dist = spec["dist"]
+        fit_kwargs = spec.get("fit_kwargs", {})
         try:
-            params = fit_func(data)
-            dist = getattr(stats, name)
+            params = dist.fit(data, **fit_kwargs)
             cdf = dist.cdf(data, *params)
             if np.any(~np.isfinite(cdf)):
                 continue
@@ -121,12 +131,24 @@ def fit_parametric_distribution(values: np.ndarray) -> dict | None:
             loglik = float(np.sum(logpdf))
             k = len(params)
             aic = 2 * k - 2 * loglik
+            bic = k * np.log(n) - 2 * loglik
         except Exception:
             continue
         score = (pval, -aic)
         if best is None or score > best[0]:
             param_list = [float(p) for p in params]
-            best = (score, {"distribution": name, "params": param_list, "ks_pvalue": float(pval), "aic": float(aic)})
+            best = (
+                score,
+                {
+                    "distribution": name,
+                    "params": param_list,
+                    "ks_pvalue": float(pval),
+                    "ks_statistic": float(stat),
+                    "aic": float(aic),
+                    "bic": float(bic),
+                    "log_likelihood": loglik,
+                },
+            )
     return best[1] if best else None
 
 
@@ -144,9 +166,21 @@ def main() -> None:
     parser.add_argument("--min-samples", type=int, default=30, help="Minimo de observaciones por combinacion")
     parser.add_argument("--bw", type=str, default="scott", help="Bandwidth para gaussian_kde (solo mode=kde)")
     parser.add_argument("--min-param-pvalue", type=float, default=0.05, help="P-valor minimo para aceptar distribucion parametrica en modo auto")
+    parser.add_argument(
+        "--param-dists",
+        type=str,
+        default="",
+        help="Lista separada por comas de distribuciones parametrizas a probar (por defecto se usan todas).",
+    )
     args = parser.parse_args()
 
     df = load_dataset(args.root)
+    allowed_dists = {name.strip().lower() for name in args.param_dists.split(",") if name.strip()}
+    invalid = allowed_dists - set(PARAMETRIC_DISTRIBUTIONS)
+    if invalid:
+        raise SystemExit(f"Distribuciones desconocidas en --param-dists: {', '.join(sorted(invalid))}")
+    allowed = allowed_dists or None
+
     grouped = df.groupby(["profile", "priority", "payment_method", "day_type"])
     rows = []
     skipped = 0
@@ -159,7 +193,7 @@ def main() -> None:
         best_param = None
         kde_result = None
         if args.mode in {"param", "auto"}:
-            best_param = fit_parametric_distribution(values)
+            best_param = fit_parametric_distribution(values, allowed=allowed)
         if args.mode in {"kde", "auto"}:
             kde_result = compute_kde(values, grid_size=args.grid_size, bandwidth=args.bw)
         if args.mode == "auto":
@@ -188,7 +222,10 @@ def main() -> None:
                     "distribution": entry["distribution"],
                     "params": json.dumps(entry["params"]),
                     "ks_pvalue": entry["ks_pvalue"],
+                    "ks_statistic": entry["ks_statistic"],
                     "aic": entry["aic"],
+                    "bic": entry["bic"],
+                    "log_likelihood": entry["log_likelihood"],
                     "x_seconds": None,
                     "density": None,
                 }
@@ -210,7 +247,10 @@ def main() -> None:
                         "distribution": None,
                         "params": None,
                         "ks_pvalue": None,
+                        "ks_statistic": None,
                         "aic": None,
+                        "bic": None,
+                        "log_likelihood": None,
                         "x_seconds": float(x),
                         "density": float(d),
                     }

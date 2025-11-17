@@ -5,9 +5,13 @@ import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-
+import sys
 import numpy as np
 import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from balking.lane_state_logger import (
     build_lane_catalog,
@@ -155,7 +159,7 @@ def analyze_day(time_log_path: Path) -> List[dict]:
                 "payment_method": payment,
                 "items": items,
                 "day_type": day_type,
-                "best_lane_type": best_type,
+                "lane_type": best_type,
                 "min_queue_length": best_len,
             }
         )
@@ -167,7 +171,7 @@ def summarize(records: List[dict]) -> pd.DataFrame:
     if df.empty:
         return df
     summary = (
-        df.groupby(["profile", "priority", "payment_method", "day_type"])["min_queue_length"]
+        df.groupby(["profile", "priority", "payment_method", "day_type", "lane_type"])["min_queue_length"]
         .agg(
             count="count",
             mean="mean",
