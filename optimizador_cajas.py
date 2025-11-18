@@ -6,6 +6,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -53,6 +56,7 @@ MAINT_CLP_PER_YEAR = {
 
 START_TIME: float | None = None
 MAX_SECONDS: float | None = None
+OPT_PROGRESS: list[dict] = []
 
 
 def _time_exceeded() -> bool:
@@ -321,11 +325,12 @@ def construir_solucion_inicial_grasp(
         num_weeks_sample=num_weeks_sample,
         num_rep=num_rep_saa,
     )
+    _print_iteration_progress("GRASP", 0, best_eval)
 
     improved = True
     iter_max = 10
 
-    for _ in range(iter_max):
+    for step in range(1, iter_max + 1):
         if _time_exceeded():
             print("Tiempo máximo alcanzado durante la fase GRASP.")
             break
@@ -374,6 +379,7 @@ def construir_solucion_inicial_grasp(
             best_eval = chosen
             x_current = chosen.x
             improved = True
+            _print_iteration_progress("GRASP", step, best_eval)
 
     return best_eval
 
@@ -401,7 +407,9 @@ def busqueda_local(
     best = current
     T = float(T0)
 
-    for _ in range(max_iter):
+    _print_iteration_progress("BUSQ", 0, current)
+
+    for iter_idx in range(1, max_iter + 1):
         if _time_exceeded():
             print("Tiempo máximo alcanzado durante la búsqueda local.")
             break
@@ -439,6 +447,7 @@ def busqueda_local(
                 prob = math.exp(delta / max(T, 1e-6))
                 if np.random.random() < prob:
                     current = cand
+        _print_iteration_progress("BUSQ", iter_idx, current)
         T *= cooling
 
     return best
@@ -446,6 +455,42 @@ def busqueda_local(
 
 def _fmt_clp(x: float) -> str:
     return f"{x:,.0f} CLP".replace(",", ".")
+
+
+def _format_policy_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{lane}={counts.get(lane, 0)}" for lane in DECISION_LANES)
+
+
+def _record_progress(label: str, iteration: int, res: EvalSAAResult) -> None:
+    counts = sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
+    cost_cfg = cost_anual_config(counts)
+    OPT_PROGRESS.append(
+        {
+            "phase": label,
+            "iteration": iteration,
+            "profit": res.profit_mean,
+            "cost": cost_cfg,
+            "objective": res.objetivo_mean,
+            "counts": counts.copy(),
+            "x": res.x,
+            "day_type": res.day_type.name,
+            "elapsed_s": time.time() - (START_TIME or time.time()),
+        }
+    )
+
+
+def _print_iteration_progress(label: str, iteration: int, res: EvalSAAResult) -> None:
+    _record_progress(label, iteration, res)
+    counts = OPT_PROGRESS[-1]["counts"]
+    cost_cfg = OPT_PROGRESS[-1]["cost"]
+    counts_str = _format_policy_counts(counts)
+    print(
+        f"[{label}] Iter {iteration}: "
+        f"x={res.x} ({counts_str}) | "
+        f"Profit={_fmt_clp(res.profit_mean)} | "
+        f"Costo={_fmt_clp(cost_cfg)} | "
+        f"Objetivo={_fmt_clp(res.objetivo_mean)}"
+    )
 
 
 def imprimir_resumen_resultado(res: EvalSAAResult, titulo: str = "Resultado") -> None:
@@ -472,6 +517,75 @@ def imprimir_resumen_resultado(res: EvalSAAResult, titulo: str = "Resultado") ->
     print("------------------------------")
 
 
+def _export_progress_plot(day_type: sim.DayType) -> Path | None:
+    entries = [e for e in OPT_PROGRESS if e["day_type"] == day_type.name]
+    if not entries:
+        return None
+    out_root = PROJECT_ROOT / "resultados_opt"
+    out_root.mkdir(parents=True, exist_ok=True)
+    idx = range(len(entries))
+    objectives = [e["objective"] for e in entries]
+    profits = [e["profit"] for e in entries]
+    costs = [e["cost"] for e in entries]
+    labels = [f"{e['phase']}#{e['iteration']}" for e in entries]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(idx, objectives, label="Objetivo", marker="o")
+    ax.plot(idx, profits, label="Profit", marker="s")
+    ax.plot(idx, costs, label="Costo", marker="^")
+    ax.set_title(f"Progreso optimización {day_type.name}")
+    ax.set_xlabel("Evaluación")
+    ax.set_ylabel("CLP")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_xticks(list(idx))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    best_entry = max(entries, key=lambda e: e["objective"])
+    counts_text = _format_policy_counts(best_entry["counts"])
+    text = (
+        f"Mejor política: {best_entry['x']} ({counts_text})\n"
+        f"Profit={_fmt_clp(best_entry['profit'])} | "
+        f"Costo={_fmt_clp(best_entry['cost'])} | "
+        f"Objetivo={_fmt_clp(best_entry['objective'])}"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.text(0.01, 0.01, text, fontsize=9, ha="left", va="bottom")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    plot_path = out_root / f"optimizer_progress_{day_type.name}_{timestamp}.png"
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"[INFO] Progreso guardado en {plot_path}")
+    return plot_path
+
+
+def _export_progress_csv(day_type: sim.DayType) -> Path | None:
+    entries = [e for e in OPT_PROGRESS if e["day_type"] == day_type.name]
+    if not entries:
+        return None
+    out_root = PROJECT_ROOT / "resultados_opt"
+    out_root.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for e in entries:
+        counts_str = _format_policy_counts(e["counts"])
+        rows.append(
+            {
+                "phase": e["phase"],
+                "iteration": e["iteration"],
+                "profit_mean": e["profit"],
+                "cost_mean": e["cost"],
+                "objective_mean": e["objective"],
+                "lane_counts": counts_str,
+                "x_tuple": e["x"],
+                "elapsed_s": e["elapsed_s"],
+            }
+        )
+    df = pd.DataFrame(rows)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    csv_path = out_root / f"optimizer_progress_{day_type.name}_{timestamp}.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"[INFO] Tabla de progreso guardada en {csv_path}")
+    return csv_path
+
+
 def optimizar_cajas_grasp_saa(
     day_type: sim.DayType,
     num_weeks_sample_construccion: int = 1,
@@ -486,43 +600,63 @@ def optimizar_cajas_grasp_saa(
     global START_TIME, MAX_SECONDS
     START_TIME = time.time()
     MAX_SECONDS = max_seconds
+    OPT_PROGRESS.clear()
 
-    print(f"\n=== Optimización para día tipo {day_type.name} ===")
-    x0_eval = construir_solucion_inicial_grasp(
-        day_type=day_type,
-        alpha=alpha,
-        num_weeks_sample=num_weeks_sample_construccion,
-        num_rep_saa=num_rep_saa_construccion,
-        max_total_lanes=max_total_lanes,
-    )
-    imprimir_resumen_resultado(
-        x0_eval,
-        titulo=f"Solución inicial (GRASP) para {day_type.name}",
-    )
+    best: EvalSAAResult | None = None
+    x0_eval: EvalSAAResult | None = None
+    try:
+        print(f"\n=== Optimizacion para dia tipo {day_type.name} ===")
+        x0_eval = construir_solucion_inicial_grasp(
+            day_type=day_type,
+            alpha=alpha,
+            num_weeks_sample=num_weeks_sample_construccion,
+            num_rep_saa=num_rep_saa_construccion,
+            max_total_lanes=max_total_lanes,
+        )
+        imprimir_resumen_resultado(
+            x0_eval,
+            titulo=f"Solucion inicial (GRASP) para {day_type.name}",
+        )
 
-    if _time_exceeded():
-        print("Tiempo máximo alcanzado tras la fase GRASP. Devolviendo solución inicial.")
-        return x0_eval
+        if _time_exceeded():
+            print("Tiempo maximo alcanzado tras la fase GRASP. Devolviendo solucion inicial.")
+            _export_progress_plot(day_type)
+            _export_progress_csv(day_type)
+            return x0_eval
 
-    best = busqueda_local(
-        x0_eval.x,
-        day_type=day_type,
-        num_weeks_sample=num_weeks_sample_busqueda,
-        num_rep_saa=num_rep_saa_busqueda,
-        max_iter=15,
-        max_total_lanes=max_total_lanes,
-        use_sa=use_sa,
-        T0=1e6,
-        cooling=0.85,
-    )
+        best = busqueda_local(
+            x0_eval.x,
+            day_type=day_type,
+            num_weeks_sample=num_weeks_sample_busqueda,
+            num_rep_saa=num_rep_saa_busqueda,
+            max_iter=15,
+            max_total_lanes=max_total_lanes,
+            use_sa=use_sa,
+            T0=1e6,
+            cooling=0.85,
+        )
 
-    imprimir_resumen_resultado(
-        best,
-        titulo=f"Mejor solución encontrada para {day_type.name}",
-    )
+        imprimir_resumen_resultado(
+            best,
+            titulo=f"Mejor solucion encontrada para {day_type.name}",
+        )
 
-    return best
-
+        _export_progress_plot(day_type)
+        _export_progress_csv(day_type)
+        return best
+    except KeyboardInterrupt:
+        print("\n[WARN] Optimizacion interrumpida por el usuario (Ctrl+C).")
+        if best is not None:
+            imprimir_resumen_resultado(best, titulo="Mejor solucion parcial")
+            _export_progress_plot(day_type)
+            _export_progress_csv(day_type)
+            return best
+        if x0_eval is not None:
+            imprimir_resumen_resultado(x0_eval, titulo="Solucion inicial disponible")
+            _export_progress_plot(day_type)
+            _export_progress_csv(day_type)
+            return x0_eval
+        raise
 
 @dataclass
 class MultiDayResult:

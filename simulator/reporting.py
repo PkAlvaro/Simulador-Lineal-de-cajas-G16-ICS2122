@@ -66,6 +66,11 @@ def load_customers_year(root: Path) -> pd.DataFrame:
     # asegura numerico por si hay celdas vacias
     out["total_profit_clp"] = pd.to_numeric(out["total_profit_clp"], errors="coerce").fillna(0)
     out["wait_time_s"] = pd.to_numeric(out["wait_time_s"], errors="coerce")
+    out["dia_tipo"] = (
+        out["day"]
+        .map(lambda d: engine.DAY_TYPE_BY_DAYNUM.get(int(d), "desconocido") if pd.notna(d) else "desconocido")
+        .str.lower()
+    )
     return out
 
 

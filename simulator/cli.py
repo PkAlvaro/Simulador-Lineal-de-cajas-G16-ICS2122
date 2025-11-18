@@ -7,7 +7,7 @@ from . import reporting
 try:
     from optimizador_cajas import optimizar_cajas_grasp_saa
 except ImportError:  # pragma: no cover
-    optimizador_cajas_grasp_saa = None
+    optimizar_cajas_grasp_saa = None
 
 
 def _prompt_int(prompt: str, default: int) -> int:
@@ -50,11 +50,12 @@ def run_full_year() -> None:
 
 
 def run_optimizer() -> None:
-    if optimizador_cajas_grasp_saa is None:
+    if optimizar_cajas_grasp_saa is None:
         print("No se pudo importar optimizador_cajas.py. Asegurate de que este disponible.")
         return
     print("Ejecutando optimizador de cajas (GRASP + SAA)...")
-    optimizador_cajas_grasp_saa()
+    import simulator.engine as engine
+    optimizar_cajas_grasp_saa(day_type=engine.DayType.TYPE_1)
 
 
 def show_menu() -> None:
