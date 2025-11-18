@@ -18,6 +18,8 @@ from .engine import (  # noqa: F401
     simulacion_periodos,
     simulacion_7_dias_completa,
     simulacion_anual_completa,
+    set_demand_multiplier,
+    get_demand_multiplier,
 )
 from .reporting import (  # noqa: F401
     load_customers_year,
@@ -36,6 +38,8 @@ __all__ = [
     "RNG_PROFIT",
     "enforce_lane_constraints",
     "update_current_lane_policy",
+    "set_demand_multiplier",
+    "get_demand_multiplier",
     "load_customers_year",
     "simulacion_periodos",
     "simulacion_7_dias_completa",

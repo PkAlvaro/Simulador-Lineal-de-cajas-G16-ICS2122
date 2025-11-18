@@ -7,13 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 import sys
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -162,12 +165,22 @@ def _evaluate_policy_once(
     num_weeks_sample: int = 1,
     run_id: str = "run",
     keep_outputs: bool = False,
+    context: str | None = None,
 ) -> tuple[float, float]:
     counts_norm = _apply_lane_config(x)
 
     output_root = PROJECT_ROOT / "outputs_opt" / f"{run_id}"
     if output_root.exists():
         shutil.rmtree(output_root, ignore_errors=True)
+
+    if context:
+        print(
+            f"[SIM] {context} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
+        )
+    else:
+        print(
+            f"[SIM] Dia={day_type.name} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
+        )
 
     sim.simulacion_periodos(
         num_weeks=num_weeks_sample,
@@ -183,7 +196,9 @@ def _evaluate_policy_once(
     ).fillna(0)
 
     df_dt = df_eval[df_eval["dia_tipo"].str.lower() == day_type.value]
-    prof_muestra = df_dt.loc[df_dt["outcome_norm"] == "served", "total_profit_clp"].sum()
+    prof_muestra = df_dt.loc[
+        df_dt["outcome_norm"] == "served", "total_profit_clp"
+    ].sum()
 
     factor_anual = 52.0 / float(num_weeks_sample)
     profit_anual = float(prof_muestra * factor_anual)
@@ -193,6 +208,13 @@ def _evaluate_policy_once(
 
     if not keep_outputs:
         shutil.rmtree(output_root, ignore_errors=True)
+
+    if context:
+        print(f"[SIM] {context} | completado | objetivo={objetivo:,.0f}")
+    else:
+        print(
+            f"[SIM] Dia={day_type.name} | completado | objetivo={objetivo:,.0f}"
+        )
 
     return float(objetivo), float(profit_anual)
 
@@ -217,6 +239,7 @@ def evaluate_policy_saa(
     num_weeks_sample: int = 1,
     num_rep: int = 3,
     keep_outputs: bool = False,
+    eval_context: str | None = None,
 ) -> EvalSAAResult:
     x = tuple(int(v) for v in x)
     key = x + (day_type,)
@@ -235,12 +258,14 @@ def evaluate_policy_saa(
         _set_global_random_seeds(seed)
 
         run_id = f"{day_type.name}_x_{x[0]}_{x[1]}_{x[2]}_{x[3]}_rep{rep}"
+        run_context = eval_context or f"Dia={day_type.name}"
         obj, prof = _evaluate_policy_once(
             x,
             day_type=day_type,
             num_weeks_sample=num_weeks_sample,
             run_id=run_id,
             keep_outputs=keep_outputs,
+            context=f"{run_context} | rep={rep + 1}/{num_rep}"
         )
         global EVAL_COUNT
         EVAL_COUNT += 1
@@ -269,9 +294,7 @@ def evaluate_policy_saa(
             objetivos_arr.std(ddof=1) if len(objetivos_arr) > 1 else 0.0
         ),
         profit_mean=float(profits_arr.mean()),
-        profit_std=float(
-            profits_arr.std(ddof=1) if len(profits_arr) > 1 else 0.0
-        ),
+        profit_std=float(profits_arr.std(ddof=1) if len(profits_arr) > 1 else 0.0),
         n_rep=len(objetivos),
         day_type=day_type,
     )
@@ -320,6 +343,7 @@ def construir_solucion_inicial_grasp(
     num_weeks_sample: int = 1,
     num_rep_saa: int = 1,
     max_total_lanes: int | None = None,
+    context_label: str | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
@@ -327,11 +351,14 @@ def construir_solucion_inicial_grasp(
     base_counts = sim.DEFAULT_LANE_COUNTS[day_type].copy()
     base_counts = sim.enforce_lane_constraints(base_counts)
     x_current = lane_dict_to_tuple(base_counts)
+    base_context = context_label or f"Dia={day_type.name}"
+
     best_eval = evaluate_policy_saa(
         x_current,
         day_type=day_type,
         num_weeks_sample=num_weeks_sample,
         num_rep=num_rep_saa,
+        eval_context=f"{base_context} | fase=GRASP | iter=0 (init)",
     )
     _print_iteration_progress("GRASP", 0, best_eval)
 
@@ -350,8 +377,9 @@ def construir_solucion_inicial_grasp(
         if not vecinos:
             break
 
+        total_vecinos = len(vecinos)
         evals: list[EvalSAAResult] = []
-        for xv in vecinos:
+        for idx, xv in enumerate(vecinos, start=1):
             if _time_exceeded() or _eval_limit_reached():
                 break
             ev = evaluate_policy_saa(
@@ -359,6 +387,10 @@ def construir_solucion_inicial_grasp(
                 day_type=day_type,
                 num_weeks_sample=num_weeks_sample,
                 num_rep=num_rep_saa,
+                eval_context=(
+                    f"{base_context} | fase=GRASP | iter={step}"
+                    f" | vecino={idx}/{total_vecinos}"
+                ),
             )
             evals.append(ev)
 
@@ -405,15 +437,19 @@ def busqueda_local(
     use_sa: bool = False,
     T0: float = 1e6,
     cooling: float = 0.9,
+    context_label: str | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
+
+    base_context = context_label or f"Dia={day_type.name}"
 
     current = evaluate_policy_saa(
         x0,
         day_type=day_type,
         num_weeks_sample=num_weeks_sample,
         num_rep=num_rep_saa,
+        eval_context=f"{base_context} | fase=BUSQ | iter=0",
     )
     best = current
     T = float(T0)
@@ -422,15 +458,18 @@ def busqueda_local(
 
     for iter_idx in range(1, max_iter + 1):
         if _time_exceeded() or _eval_limit_reached():
-            print("Tiempo o limite de evaluaciones alcanzado durante la búsqueda local.")
+            print(
+                "Tiempo o limite de evaluaciones alcanzado durante la búsqueda local."
+            )
             break
 
         vecinos = generar_vecinos(current.x, max_total_lanes=max_total_lanes)
         if not vecinos:
             break
 
+        total_vecinos = len(vecinos)
         vec_evals: list[EvalSAAResult] = []
-        for xv in vecinos:
+        for idx, xv in enumerate(vecinos, start=1):
             if _time_exceeded():
                 break
             ev = evaluate_policy_saa(
@@ -438,6 +477,10 @@ def busqueda_local(
                 day_type=day_type,
                 num_weeks_sample=num_weeks_sample,
                 num_rep=num_rep_saa,
+                eval_context=(
+                    f"{base_context} | fase=BUSQ | iter={iter_idx}"
+                    f" | vecino={idx}/{total_vecinos}"
+                ),
             )
             vec_evals.append(ev)
 
@@ -510,20 +553,28 @@ def imprimir_resumen_resultado(res: EvalSAAResult, titulo: str = "Resultado") ->
     cost_config = cost_anual_config(counts)
 
     print(f"\n--- {titulo} ({res.day_type.name}) ---")
-    print(f"Configuración x = (regular={res.x[0]}, express={res.x[1]}, "
-          f"priority={res.x[2]}, self_checkout={res.x[3]})")
+    print(
+        f"Configuración x = (regular={res.x[0]}, express={res.x[1]}, "
+        f"priority={res.x[2]}, self_checkout={res.x[3]})"
+    )
     print(f"Config normalizada: {counts}  (total {total_lanes} cajas)")
 
     print("\nCostos:")
     print(f"  Costo anual configuración: {_fmt_clp(cost_config)}")
     print("\nDesempeño estimado (SAA):")
-    print(f"  Profit anual medio      ≈ {_fmt_clp(res.profit_mean)} "
-          f"(± {res.profit_std:,.0f})")
-    print(f"  Objetivo (profit - costo) medio ≈ {_fmt_clp(res.objetivo_mean)} "
-          f"(± {res.objetivo_std:,.0f})")
+    print(
+        f"  Profit anual medio      ≈ {_fmt_clp(res.profit_mean)} "
+        f"(± {res.profit_std:,.0f})"
+    )
+    print(
+        f"  Objetivo (profit - costo) medio ≈ {_fmt_clp(res.objetivo_mean)} "
+        f"(± {res.objetivo_std:,.0f})"
+    )
     if total_lanes > 0:
         print(f"  Profit medio por caja   ≈ {_fmt_clp(res.profit_mean / total_lanes)}")
-        print(f"  Objetivo medio por caja ≈ {_fmt_clp(res.objetivo_mean / total_lanes)}")
+        print(
+            f"  Objetivo medio por caja ≈ {_fmt_clp(res.objetivo_mean / total_lanes)}"
+        )
     print(f"  Réplicas SAA usadas: {res.n_rep}")
     print("------------------------------")
 
@@ -546,8 +597,7 @@ def _export_progress_plot(day_type: sim.DayType) -> Path | None:
     ax.set_title(f"Progreso optimización {day_type.name}")
     ax.set_xlabel("Evaluación")
     ax.set_ylabel("CLP (miles de millones)")
-    fmt_values = [val / 1e9 for val in ax.get_yticks()]
-    ax.set_yticklabels([f"{val:.2f}" for val in fmt_values])
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda val, _pos: f"{val / 1e9:.2f}"))
     base_obj = entries[0]["objective"]
     ax.axhline(base_obj, linestyle="--", color="gray", label="Objetivo base")
     ax.grid(True, alpha=0.3)
@@ -618,6 +668,8 @@ def optimizar_cajas_grasp_saa(
     use_sa: bool = False,
     max_seconds: float | None = None,
     max_eval_count: int | None = None,
+    initial_solution: tuple[int, int, int, int] | None = None,
+    context_label: str | None = None,
 ) -> EvalSAAResult:
     global START_TIME, MAX_SECONDS, MAX_EVALS, EVAL_COUNT
     START_TIME = time.time()
@@ -628,22 +680,46 @@ def optimizar_cajas_grasp_saa(
 
     best: EvalSAAResult | None = None
     x0_eval: EvalSAAResult | None = None
+    context_base = context_label or f"Dia={day_type.name}"
+
     try:
         print(f"\n=== Optimizacion para dia tipo {day_type.name} ===")
-        x0_eval = construir_solucion_inicial_grasp(
-            day_type=day_type,
-            alpha=alpha,
-            num_weeks_sample=num_weeks_sample_construccion,
-            num_rep_saa=num_rep_saa_construccion,
-            max_total_lanes=max_total_lanes,
-        )
-        imprimir_resumen_resultado(
-            x0_eval,
-            titulo=f"Solucion inicial (GRASP) para {day_type.name}",
-        )
+
+        if initial_solution is not None:
+            tuple_init = tuple(int(max(0, v)) for v in initial_solution)
+            normalized = lane_dict_to_tuple(
+                sim.enforce_lane_constraints(lane_tuple_to_dict(tuple_init))
+            )
+            x0_eval = evaluate_policy_saa(
+                normalized,
+                day_type=day_type,
+                num_weeks_sample=num_weeks_sample_busqueda,
+                num_rep=num_rep_saa_busqueda,
+                keep_outputs=False,
+                eval_context=f"{context_base} | fase=INIT_HEREDADA",
+            )
+            imprimir_resumen_resultado(
+                x0_eval,
+                titulo=f"Solucion inicial (heredada) para {day_type.name}",
+            )
+        else:
+            x0_eval = construir_solucion_inicial_grasp(
+                day_type=day_type,
+                alpha=alpha,
+                num_weeks_sample=num_weeks_sample_construccion,
+                num_rep_saa=num_rep_saa_construccion,
+                max_total_lanes=max_total_lanes,
+                context_label=context_base,
+            )
+            imprimir_resumen_resultado(
+                x0_eval,
+                titulo=f"Solucion inicial (GRASP) para {day_type.name}",
+            )
 
         if _time_exceeded():
-            print("Tiempo maximo alcanzado tras la fase GRASP. Devolviendo solucion inicial.")
+            print(
+                "Tiempo maximo alcanzado tras la fase GRASP. Devolviendo solucion inicial."
+            )
             _export_progress_plot(day_type)
             _export_progress_csv(day_type)
             return x0_eval
@@ -658,6 +734,7 @@ def optimizar_cajas_grasp_saa(
             use_sa=use_sa,
             T0=1e6,
             cooling=0.85,
+            context_label=context_base,
         )
 
         imprimir_resumen_resultado(
@@ -681,6 +758,7 @@ def optimizar_cajas_grasp_saa(
             _export_progress_csv(day_type)
             return x0_eval
         raise
+
 
 @dataclass
 class MultiDayResult:
@@ -710,15 +788,11 @@ def combinar_resultados_por_tipo(
 
     counts_por_tipo: dict[sim.DayType, dict[str, int]] = {}
     for dt, res in res_por_tipo.items():
-        counts_por_tipo[dt] = sim.enforce_lane_constraints(
-            lane_tuple_to_dict(res.x)
-        )
+        counts_por_tipo[dt] = sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
 
     counts_max: dict[str, int] = {lane: 0 for lane in DECISION_LANES}
     for lane in DECISION_LANES:
-        counts_max[lane] = max(
-            counts_por_tipo[dt][lane] for dt in counts_por_tipo
-        )
+        counts_max[lane] = max(counts_por_tipo[dt][lane] for dt in counts_por_tipo)
 
     cost_infra_anual = cost_anual_config(counts_max)
     objective_global = profit_global - cost_infra_anual
@@ -744,8 +818,10 @@ def imprimir_resumen_global_multi_dia(multi: MultiDayResult) -> None:
 
     print("\nResultados por tipo de día:")
     for dt, res in multi.por_tipo.items():
-        print(f"- {dt.name:10s}: profit medio ≈ {_fmt_clp(res.profit_mean)} "
-              f"(± {res.profit_std:,.0f}), objetivo ≈ {_fmt_clp(res.objetivo_mean)}")
+        print(
+            f"- {dt.name:10s}: profit medio ≈ {_fmt_clp(res.profit_mean)} "
+            f"(± {res.profit_std:,.0f}), objetivo ≈ {_fmt_clp(res.objetivo_mean)}"
+        )
 
     counts_por_tipo = {
         dt: sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
@@ -753,13 +829,13 @@ def imprimir_resumen_global_multi_dia(multi: MultiDayResult) -> None:
     }
     counts_max = {lane: 0 for lane in DECISION_LANES}
     for lane in DECISION_LANES:
-        counts_max[lane] = max(
-            counts_por_tipo[dt][lane] for dt in counts_por_tipo
-        )
+        counts_max[lane] = max(counts_por_tipo[dt][lane] for dt in counts_por_tipo)
 
     print("\nInfraestructura requerida (configuración máxima entre tipos):")
-    print(f"  Configuración máxima: {counts_max} "
-          f"(total {sum(counts_max.values())} cajas)")
+    print(
+        f"  Configuración máxima: {counts_max} "
+        f"(total {sum(counts_max.values())} cajas)"
+    )
     print(f"  Costo anual infraestructura: {_fmt_clp(multi.cost_infra_anual)}")
 
     print("\nObjetivo global (ponderado por frecuencia de tipos de día):")
@@ -787,6 +863,7 @@ def run_optimizer_cli() -> None:
             use_sa=False,
             max_seconds=600.0,
             max_eval_count=None,
+            context_label=f"CLI-SCRIPT | Día={dt.name}",
         )
         res_por_tipo[dt] = res
 

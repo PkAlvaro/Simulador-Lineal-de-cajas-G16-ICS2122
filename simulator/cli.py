@@ -52,12 +52,17 @@ def run_full_year() -> None:
 
 def run_optimizer() -> None:
     if optimizar_cajas_grasp_saa is None:
-        print("No se pudo importar optimizador_cajas.py. Asegurate de que este disponible.")
+        print(
+            "No se pudo importar optimizador_cajas.py. Asegurate de que este disponible."
+        )
         return
     print("Ejecutando optimizador de cajas (GRASP + SAA)...")
     import simulator.engine as engine
 
-    mode = input("Modo 1=tipo especifico / 2=optimizar todos los tipos [1]: ").strip() or "1"
+    mode = (
+        input("Modo 1=tipo especifico / 2=optimizar todos los tipos [1]: ").strip()
+        or "1"
+    )
     max_seconds = _prompt_int("Limite de tiempo en segundos (0 = sin limite)", 0)
     max_seconds = max_seconds if max_seconds > 0 else None
     max_evals = _prompt_int("Limite de evaluaciones (0 = sin limite)", 0)
@@ -67,7 +72,9 @@ def run_optimizer() -> None:
         day_values = [dt.value for dt in engine.DayType]
         with ProcessPoolExecutor(max_workers=len(day_values)) as pool:
             futures = {
-                pool.submit(_optimizer_worker, day_value, max_seconds, max_evals): day_value
+                pool.submit(
+                    _optimizer_worker, day_value, max_seconds, max_evals
+                ): day_value
                 for day_value in day_values
             }
             for fut in as_completed(futures):
@@ -88,8 +95,128 @@ def run_optimizer() -> None:
             day_type=day,
             max_seconds=max_seconds,
             max_eval_count=max_evals,
+            context_label=f"CLI | Día={day.name}",
         )
         _print_optimizer_summary(result)
+
+
+def run_sequential_policy_plan() -> None:
+    if optimizar_cajas_grasp_saa is None:
+        print(
+            "No se pudo importar optimizador_cajas.py. Asegurate de que este disponible."
+        )
+        return
+
+    try:
+        from .policy_planner import plan_multi_year_optimization
+    except ImportError as exc:  # pragma: no cover
+        print(f"No se pudo importar policy_planner: {exc}")
+        return
+
+    default_segmented = "demand_projection_2026_2030_segmented.csv"
+    segmented_input = (
+        input(f"Archivo segmentado [{default_segmented}]: ").strip()
+        or default_segmented
+    )
+    segmented_path = Path(segmented_input)
+    if not segmented_path.exists():
+        print(f"Archivo segmentado no encontrado: {segmented_path}")
+        return
+
+    default_summary = segmented_path.with_name(segmented_path.stem + "_fit_summary.csv")
+    summary_input = input(
+        f"Archivo de resumen de ajustes (enter para {default_summary.name} o 'none'): "
+    ).strip()
+    if not summary_input:
+        summary_path: Path | None = (
+            default_summary if default_summary.exists() else None
+        )
+        if summary_path is None:
+            print("No se encontró resumen de ajustes, se usará media muestral.")
+    elif summary_input.lower() in {"none", "ninguno"}:
+        summary_path = None
+    else:
+        summary_path = Path(summary_input)
+        if not summary_path.exists():
+            print(f"Resumen no encontrado: {summary_path}. Se usará media muestral.")
+            summary_path = None
+
+    segments_raw = input(
+        "Segmentos a considerar (coma, enter=default pesimista,regular,optimista): "
+    ).strip()
+    if segments_raw:
+        segments = tuple(seg.strip() for seg in segments_raw.split(",") if seg.strip())
+    else:
+        segments = ("pesimista", "regular", "optimista")
+
+    years_raw = input("Años a optimizar (coma, enter=todos): ").strip()
+    years = (
+        tuple(year.strip() for year in years_raw.split(",") if year.strip())
+        if years_raw
+        else None
+    )
+
+    max_workers = _prompt_int("Cantidad de procesos en paralelo (0 = auto)", 0)
+    max_workers = max_workers if max_workers > 0 else None
+
+    weeks_busqueda = _prompt_int("Semanas por evaluación en búsqueda local", 1)
+    weeks_busqueda = _normalize_weeks_choice(max(1, weeks_busqueda))
+
+    reps_busqueda = _prompt_int("Repeticiones SAA por evaluación", 3)
+    reps_busqueda = max(1, reps_busqueda)
+
+    weeks_construccion = _prompt_int("Semanas por evaluación en fase GRASP", 1)
+    weeks_construccion = _normalize_weeks_choice(max(1, weeks_construccion))
+
+    reps_construccion = _prompt_int("Repeticiones SAA en fase GRASP", 1)
+    reps_construccion = max(1, reps_construccion)
+
+    max_seconds = _prompt_int("Límite de tiempo por corrida (0 = sin límite)", 0)
+    max_seconds = max_seconds if max_seconds > 0 else None
+
+    max_evals = _prompt_int("Límite de evaluaciones por corrida (0 = sin límite)", 0)
+    max_evals = max_evals if max_evals > 0 else None
+
+    print("\n[PLAN] Iniciando planificación secuencial multi-año...")
+    try:
+        result = plan_multi_year_optimization(
+            segmented_path=segmented_path,
+            fit_summary_path=summary_path,
+            segments=segments,
+            years=years if years else None,
+            max_workers=max_workers,
+            optimizer_kwargs={
+                "num_weeks_sample_busqueda": weeks_busqueda,
+                "num_rep_saa_busqueda": reps_busqueda,
+                "num_weeks_sample_construccion": weeks_construccion,
+                "num_rep_saa_construccion": reps_construccion,
+                "max_seconds": max_seconds,
+                "max_eval_count": max_evals,
+            },
+        )
+    except Exception as exc:
+        print(f"[ERROR] No se pudo completar la planificación: {exc}")
+        return
+
+    print("\n=== RESULTADOS BASE (Año 2025) ===")
+    for dt, res in result.base_year.items():
+        _print_optimizer_summary(res)
+
+    for year, per_segment in result.yearly.items():
+        print(f"\n=== RESULTADOS AÑO {year} ===")
+        for segment, dt_map in per_segment.items():
+            print(f"-- Segmento {segment} --")
+            for dt, res in dt_map.items():
+                _print_optimizer_summary(res)
+
+    print("\n=== MULTIPLICADORES UTILIZADOS ===")
+    for segment, mapping in result.multipliers.items():
+        formatted = ", ".join(
+            f"{year}:{value:.4f}" for year, value in sorted(mapping.items())
+        )
+        print(f"{segment}: {formatted}")
+
+    print("\nPlanificación completada.")
 
 
 def _optimizer_worker(day_value: str, max_seconds: int | None, max_evals: int | None):
@@ -101,6 +228,7 @@ def _optimizer_worker(day_value: str, max_seconds: int | None, max_evals: int | 
         day_type=day,
         max_seconds=max_seconds,
         max_eval_count=max_evals,
+        context_label=f"CLI|POOL | Día={day.name}",
     )
 
 
@@ -111,7 +239,9 @@ def _print_optimizer_summary(res):
     counts_str = ", ".join(f"{name}={value}" for name, value in zip(lane_names, res.x))
     profit_fmt = f"{res.profit_mean:,.0f}".replace(",", ".")
     objective_fmt = f"{res.objetivo_mean:,.0f}".replace(",", ".")
-    print(f"[RESUMEN {res.day_type.name}] x={res.x} ({counts_str}) | Profit={profit_fmt} CLP | Objetivo={objective_fmt} CLP")
+    print(
+        f"[RESUMEN {res.day_type.name}] x={res.x} ({counts_str}) | Profit={profit_fmt} CLP | Objetivo={objective_fmt} CLP"
+    )
 
 
 def show_menu() -> None:
@@ -121,7 +251,8 @@ def show_menu() -> None:
 1) Simular X semanas y generar KPIs
 2) Simular año completo (52 semanas)
 3) Ejecutar optimizador de cajas (GRASP+SAA)
-4) Salir
+4) Planificación secuencial multi-año
+5) Salir
 """
     )
 
@@ -131,11 +262,12 @@ def main() -> None:
         "1": run_sample_simulation,
         "2": run_full_year,
         "3": run_optimizer,
+        "4": run_sequential_policy_plan,
     }
     while True:
         show_menu()
         choice = input("Selecciona una opcion: ").strip()
-        if choice == "4" or choice.lower() in {"q", "quit", "salir"}:
+        if choice == "5" or choice.lower() in {"q", "quit", "salir"}:
             print("Hasta luego.")
             break
         action = actions.get(choice)
