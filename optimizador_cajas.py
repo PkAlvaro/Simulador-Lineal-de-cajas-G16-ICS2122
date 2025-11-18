@@ -370,6 +370,7 @@ def construir_solucion_inicial_grasp(
         best_obj = evals[0].objetivo_mean
         worst_obj = evals[-1].objetivo_mean
         if best_obj <= best_eval.objetivo_mean:
+            _print_iteration_progress("GRASP", step, best_eval)
             break
 
         if best_obj == worst_obj:
@@ -387,7 +388,9 @@ def construir_solucion_inicial_grasp(
             best_eval = chosen
             x_current = chosen.x
             improved = True
-            _print_iteration_progress("GRASP", step, best_eval)
+        _print_iteration_progress("GRASP", step, best_eval)
+        if not improved:
+            break
 
     return best_eval
 
@@ -542,18 +545,28 @@ def _export_progress_plot(day_type: sim.DayType) -> Path | None:
     ax.plot(idx, costs, label="Costo", marker="^")
     ax.set_title(f"Progreso optimización {day_type.name}")
     ax.set_xlabel("Evaluación")
-    ax.set_ylabel("CLP")
+    ax.set_ylabel("CLP (miles de millones)")
+    fmt_values = [val / 1e9 for val in ax.get_yticks()]
+    ax.set_yticklabels([f"{val:.2f}" for val in fmt_values])
+    base_obj = entries[0]["objective"]
+    ax.axhline(base_obj, linestyle="--", color="gray", label="Objetivo base")
     ax.grid(True, alpha=0.3)
     ax.legend()
     ax.set_xticks(list(idx))
     ax.set_xticklabels(labels, rotation=45, ha="right")
     best_entry = max(entries, key=lambda e: e["objective"])
     counts_text = _format_policy_counts(best_entry["counts"])
+    improvement_pct = (
+        ((best_entry["objective"] - base_obj) / abs(base_obj)) * 100.0
+        if base_obj not in (0, None)
+        else 0.0
+    )
     text = (
         f"Mejor política: {best_entry['x']} ({counts_text})\n"
         f"Profit={_fmt_clp(best_entry['profit'])} | "
         f"Costo={_fmt_clp(best_entry['cost'])} | "
-        f"Objetivo={_fmt_clp(best_entry['objective'])}"
+        f"Objetivo={_fmt_clp(best_entry['objective'])}\n"
+        f"Mejora vs base: {improvement_pct:.2f}%"
     )
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.text(0.01, 0.01, text, fontsize=9, ha="left", va="bottom")
