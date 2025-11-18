@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from . import reporting
@@ -55,7 +56,62 @@ def run_optimizer() -> None:
         return
     print("Ejecutando optimizador de cajas (GRASP + SAA)...")
     import simulator.engine as engine
-    optimizar_cajas_grasp_saa(day_type=engine.DayType.TYPE_1)
+
+    mode = input("Modo 1=tipo especifico / 2=optimizar todos los tipos [1]: ").strip() or "1"
+    max_seconds = _prompt_int("Limite de tiempo en segundos (0 = sin limite)", 0)
+    max_seconds = max_seconds if max_seconds > 0 else None
+    max_evals = _prompt_int("Limite de evaluaciones (0 = sin limite)", 0)
+    max_evals = max_evals if max_evals > 0 else None
+
+    if mode == "2":
+        day_values = [dt.value for dt in engine.DayType]
+        with ProcessPoolExecutor(max_workers=len(day_values)) as pool:
+            futures = {
+                pool.submit(_optimizer_worker, day_value, max_seconds, max_evals): day_value
+                for day_value in day_values
+            }
+            for fut in as_completed(futures):
+                day_value = futures[fut]
+                try:
+                    result = fut.result()
+                    _print_optimizer_summary(result)
+                except Exception as exc:  # pragma: no cover
+                    print(f"[ERROR] Optimización falló para {day_value}: {exc}")
+    else:
+        mapping = {str(i + 1): dt for i, dt in enumerate(engine.DayType)}
+        print("Selecciona tipo de dia a optimizar:")
+        for key, dt in mapping.items():
+            print(f"  {key}) {dt.name} ({dt.value})")
+        choice = input("Opcion [1]: ").strip() or "1"
+        day = mapping.get(choice, engine.DayType.TYPE_1)
+        result = optimizar_cajas_grasp_saa(
+            day_type=day,
+            max_seconds=max_seconds,
+            max_eval_count=max_evals,
+        )
+        _print_optimizer_summary(result)
+
+
+def _optimizer_worker(day_value: str, max_seconds: int | None, max_evals: int | None):
+    import simulator.engine as engine
+    from optimizador_cajas import optimizar_cajas_grasp_saa as worker_opt
+
+    day = next(dt for dt in engine.DayType if dt.value == day_value)
+    return worker_opt(
+        day_type=day,
+        max_seconds=max_seconds,
+        max_eval_count=max_evals,
+    )
+
+
+def _print_optimizer_summary(res):
+    if not res:
+        return
+    lane_names = ["regular", "express", "priority", "self_checkout"]
+    counts_str = ", ".join(f"{name}={value}" for name, value in zip(lane_names, res.x))
+    profit_fmt = f"{res.profit_mean:,.0f}".replace(",", ".")
+    objective_fmt = f"{res.objetivo_mean:,.0f}".replace(",", ".")
+    print(f"[RESUMEN {res.day_type.name}] x={res.x} ({counts_str}) | Profit={profit_fmt} CLP | Objetivo={objective_fmt} CLP")
 
 
 def show_menu() -> None:

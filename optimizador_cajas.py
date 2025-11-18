@@ -604,10 +604,13 @@ def optimizar_cajas_grasp_saa(
     alpha: float = 0.5,
     use_sa: bool = False,
     max_seconds: float | None = None,
+    max_eval_count: int | None = None,
 ) -> EvalSAAResult:
-    global START_TIME, MAX_SECONDS
+    global START_TIME, MAX_SECONDS, MAX_EVALS, EVAL_COUNT
     START_TIME = time.time()
-    MAX_SECONDS = max_seconds
+    MAX_SECONDS = max_seconds if max_seconds and max_seconds > 0 else None
+    MAX_EVALS = max_eval_count if max_eval_count and max_eval_count > 0 else None
+    EVAL_COUNT = 0
     OPT_PROGRESS.clear()
 
     best: EvalSAAResult | None = None
@@ -770,6 +773,7 @@ def run_optimizer_cli() -> None:
             alpha=0.5,
             use_sa=False,
             max_seconds=600.0,
+            max_eval_count=None,
         )
         res_por_tipo[dt] = res
 
