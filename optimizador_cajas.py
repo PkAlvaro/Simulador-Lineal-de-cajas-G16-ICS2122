@@ -56,6 +56,8 @@ MAINT_CLP_PER_YEAR = {
 
 START_TIME: float | None = None
 MAX_SECONDS: float | None = None
+MAX_EVALS: int | None = None
+EVAL_COUNT: int = 0
 OPT_PROGRESS: list[dict] = []
 
 
@@ -63,6 +65,10 @@ def _time_exceeded() -> bool:
     if START_TIME is None or MAX_SECONDS is None:
         return False
     return (time.time() - START_TIME) >= MAX_SECONDS
+
+
+def _eval_limit_reached() -> bool:
+    return MAX_EVALS is not None and EVAL_COUNT >= MAX_EVALS
 
 
 def _load_annual_costs_from_csv(csv_path: Path) -> dict[str, float]:
@@ -222,7 +228,7 @@ def evaluate_policy_saa(
     profits: list[float] = []
 
     for rep in range(num_rep):
-        if _time_exceeded():
+        if _time_exceeded() or _eval_limit_reached():
             break
 
         seed = 12345 + 10000 * rep + 101 * x[0] + 17 * x[1] + 7 * x[2] + 3 * x[3]
@@ -236,6 +242,8 @@ def evaluate_policy_saa(
             run_id=run_id,
             keep_outputs=keep_outputs,
         )
+        global EVAL_COUNT
+        EVAL_COUNT += 1
         objetivos.append(obj)
         profits.append(prof)
 
@@ -331,8 +339,8 @@ def construir_solucion_inicial_grasp(
     iter_max = 10
 
     for step in range(1, iter_max + 1):
-        if _time_exceeded():
-            print("Tiempo máximo alcanzado durante la fase GRASP.")
+        if _time_exceeded() or _eval_limit_reached():
+            print("Tiempo o limite de evaluaciones alcanzado durante la fase GRASP.")
             break
         if not improved:
             break
@@ -344,7 +352,7 @@ def construir_solucion_inicial_grasp(
 
         evals: list[EvalSAAResult] = []
         for xv in vecinos:
-            if _time_exceeded():
+            if _time_exceeded() or _eval_limit_reached():
                 break
             ev = evaluate_policy_saa(
                 xv,
@@ -410,8 +418,8 @@ def busqueda_local(
     _print_iteration_progress("BUSQ", 0, current)
 
     for iter_idx in range(1, max_iter + 1):
-        if _time_exceeded():
-            print("Tiempo máximo alcanzado durante la búsqueda local.")
+        if _time_exceeded() or _eval_limit_reached():
+            print("Tiempo o limite de evaluaciones alcanzado durante la búsqueda local.")
             break
 
         vecinos = generar_vecinos(current.x, max_total_lanes=max_total_lanes)
