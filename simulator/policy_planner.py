@@ -96,9 +96,7 @@ def plan_multi_year_optimization(
         context_label = f"Año=2025 | Segmento=base | Día={dt.name}"
         base_kwargs = dict(optimizer_kwargs)
         base_kwargs["context_label"] = context_label
-        base_year_results[dt] = optimizar_cajas_grasp_saa(
-            day_type=dt, **base_kwargs
-        )
+        base_year_results[dt] = optimizar_cajas_grasp_saa(day_type=dt, **base_kwargs)
 
     previous_solutions: Dict[str, Dict[DayType, tuple[int, int, int, int]]] = {
         str(segment): {

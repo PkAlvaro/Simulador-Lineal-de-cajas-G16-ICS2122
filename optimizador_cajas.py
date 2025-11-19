@@ -174,9 +174,7 @@ def _evaluate_policy_once(
         shutil.rmtree(output_root, ignore_errors=True)
 
     if context:
-        print(
-            f"[SIM] {context} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
-        )
+        print(f"[SIM] {context} | semanas={num_weeks_sample} | run_id={run_id} | x={x}")
     else:
         print(
             f"[SIM] Dia={day_type.name} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
@@ -212,9 +210,7 @@ def _evaluate_policy_once(
     if context:
         print(f"[SIM] {context} | completado | objetivo={objetivo:,.0f}")
     else:
-        print(
-            f"[SIM] Dia={day_type.name} | completado | objetivo={objetivo:,.0f}"
-        )
+        print(f"[SIM] Dia={day_type.name} | completado | objetivo={objetivo:,.0f}")
 
     return float(objetivo), float(profit_anual)
 
@@ -265,7 +261,7 @@ def evaluate_policy_saa(
             num_weeks_sample=num_weeks_sample,
             run_id=run_id,
             keep_outputs=keep_outputs,
-            context=f"{run_context} | rep={rep + 1}/{num_rep}"
+            context=f"{run_context} | rep={rep + 1}/{num_rep}",
         )
         global EVAL_COUNT
         EVAL_COUNT += 1
