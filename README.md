@@ -1,3 +1,5 @@
+> **Disclaimer**: Este documento README.md, así como gran parte del código del proyecto, han sido generados con asistencia de Inteligencia Artificial.
+
 # SIMULADOR FINAL P2
 
 Este repositorio contiene el simulador integral de cajas de supermercado (Proyecto P2). El objetivo es emular el flujo completo de clientes (arribos, asignación de cajas, tiempos de servicio/paciencia, balking y métricas operacionales) y compararlo contra la base teórica para realizar calibraciones recurrentes.
@@ -6,9 +8,11 @@ Este repositorio contiene el simulador integral de cajas de supermercado (Proyec
 
 - `simulator/engine.py`: motor del simulador (arribos PPNH, lógica de colas, tiempos de servicio, balking, reporting).
 - `simulator/reporting.py`: generación de KPI y exportes en CSV/XLSX (incluye hojas formateadas con profit, TAC, TMC, tiempos de servicio, tabla de clientes y análisis de Little).
+- `simulator/policy_planner.py`: módulo de planificación estratégica que gestiona la optimización secuencial multi-año (2025-2030) y la evaluación de políticas de inversión única (`single_investment`).
 - `tools/`: scripts auxiliares para reconstruir parámetros desde los outputs teóricos. Entre otros:
   - `rebuild_arrivals.py`: genera los `.npz` de lambdas por perfil/prioridad/medio de pago/día. Cuenta con la opción `--apply-little` para escalar las tasas de llegada usando la ley de Little.
   - `calc_service_time_multipliers.py`: calcula multiplicadores por `(lane_type, profile)` comparando los tiempos teóricos vs. la predicción del modelo `service_time_model.json`. El resultado se guarda en `service_time/service_time_multipliers.csv` y se aplica automáticamente en el simulador.
+  - `run_sensitivity_plan.py`: ejecuta un análisis de sensibilidad variando los límites de ítems para cajas rápidas y *self-checkout* bajo distintos escenarios definidos en un JSON.
 - `arrivals_npz/`: lambdas PPNH por perfil (se generan con el script anterior).
 - `service_time/`: definiciones del modelo de tiempo de servicio y los multiplicadores.
 - `patience/`: distribuciones de paciencia (por perfil, prioridad y medio de pago) que se cargan en cada corrida.
@@ -35,6 +39,7 @@ Este repositorio contiene el simulador integral de cajas de supermercado (Proyec
    - `1` → simular N semanas y generar KPIs.
    - `2` → simular el año completo (52 semanas).
    - `3` → optimizador de cajas (GRASP+SAA) para cada tipo de día, combinando resultados y descontando costo anual de infraestructura.
+   - `4` → planificación secuencial multi-año: optimiza políticas para el horizonte 2026-2030 basándose en proyecciones de demanda (segmentos pesimista, regular, optimista) y re-optimizando año a año o buscando una política única de inversión.
 
 ## Métricas generadas
 
@@ -44,6 +49,19 @@ Este repositorio contiene el simulador integral de cajas de supermercado (Proyec
 - `resultados/kpi_formato_YYYYMMDD_HHMMSS.xlsx`: versión formateada (hoja principal + pestañas “Clientes” y “Little”). Estas hojas incluyen:
   - Comparación simulación vs. caso base (`served/abandoned/balked` por perfil y tipo de día).
   - Análisis de la ley de Little (`λ`, `W`, `L` teóricos vs. simulados).
+
+## Análisis de Sensibilidad
+
+Para evaluar el impacto de cambiar los límites de productos en cajas Express y Self-Checkout, se utiliza el script dedicado:
+
+```bash
+python tools/run_sensitivity_plan.py \
+    --scenarios scenarios_limits.json \
+    --segments pesimista,regular,optimista \
+    --output-dir resultados_sensibilidad
+```
+
+Esto generará reportes comparativos en `resultados_sensibilidad/` para cada escenario configurado en el JSON.
 
 ## Notas adicionales
 
