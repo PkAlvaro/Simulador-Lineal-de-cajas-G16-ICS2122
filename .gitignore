@@ -6,3 +6,6 @@ resultados/
 pycache__/
 __pycache__/
 *.pyc
+outputs*
+resultados*
+*.zip
