@@ -97,6 +97,42 @@ MAX_TOTAL_LANES = 40
 EXPRESS_BLOCK = None  # express lanes are free, kept for clarity
 SCO_BLOCK = 5
 LANE_ORDER = ["regular", "express", "priority", "self_checkout"]
+
+_DEFAULT_EXPRESS_MAX_ITEMS = 10
+_DEFAULT_SCO_MAX_ITEMS = 15
+_EXPRESS_MAX_ITEMS = _DEFAULT_EXPRESS_MAX_ITEMS
+_SCO_MAX_ITEMS = _DEFAULT_SCO_MAX_ITEMS
+
+
+def set_checkout_item_limits(
+    express_max: Optional[int] = None, sco_max: Optional[int] = None
+) -> tuple[int, int]:
+    """Actualiza los límites de ítems permitidos por tipo de caja."""
+    global _EXPRESS_MAX_ITEMS, _SCO_MAX_ITEMS
+    if express_max is not None:
+        try:
+            value = int(express_max)
+            _EXPRESS_MAX_ITEMS = max(1, value)
+        except (TypeError, ValueError):
+            pass
+    if sco_max is not None:
+        try:
+            value = int(sco_max)
+            _SCO_MAX_ITEMS = max(1, value)
+        except (TypeError, ValueError):
+            pass
+    return _EXPRESS_MAX_ITEMS, _SCO_MAX_ITEMS
+
+
+def reset_checkout_item_limits() -> tuple[int, int]:
+    """Restaura los límites de ítems a sus valores por defecto."""
+    return set_checkout_item_limits(
+        express_max=_DEFAULT_EXPRESS_MAX_ITEMS, sco_max=_DEFAULT_SCO_MAX_ITEMS
+    )
+
+
+def get_checkout_item_limits() -> tuple[int, int]:
+    return _EXPRESS_MAX_ITEMS, _SCO_MAX_ITEMS
 LANE_PREFIXES = {
     LaneType.REGULAR: "REG",
     LaneType.EXPRESS: "EXP",
@@ -1345,10 +1381,13 @@ def elegible(cliente, lane: CheckoutLane) -> bool:
     pr = cliente["priority"]
     pm = cliente["payment_method"]
     items = int(cliente["items"])
-    if lane.lane_type == LaneType.EXPRESS and items > 10:
+    express_limit, sco_limit = get_checkout_item_limits()
+    if lane.lane_type == LaneType.EXPRESS and items > express_limit:
         return False
     if lane.lane_type == LaneType.SCO and (
-        pm != PaymentMethod.CARD or pr == PriorityType.REDUCED_MOBILITY or items > 15
+        pm != PaymentMethod.CARD
+        or pr == PriorityType.REDUCED_MOBILITY
+        or items > sco_limit
     ):
         return False
     return True

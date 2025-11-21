@@ -218,6 +218,41 @@ def build_initial_policies_dataframe(
     )
 
 
+def _build_policy_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
+    if detail_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "segment",
+                "day_type",
+                "regular",
+                "express",
+                "priority",
+                "self_checkout",
+                "infra_cost_clp",
+                "profit_mean",
+                "objetivo_mean",
+                "base_profit_mean",
+                "base_objetivo_mean",
+                "profit_delta_vs_base",
+                "objetivo_delta_vs_base",
+            ]
+        )
+    grouped = (
+        detail_df.groupby(["segment", "day_type", "regular", "express", "priority", "self_checkout"], dropna=False)
+        .agg(
+            infra_cost_clp=("infra_cost_clp", "mean"),
+            profit_mean=("profit_mean", "mean"),
+            objetivo_mean=("objetivo_mean", "mean"),
+            base_profit_mean=("base_profit_mean", "mean"),
+            base_objetivo_mean=("base_objetivo_mean", "mean"),
+            profit_delta_vs_base=("profit_delta_vs_base", "mean"),
+            objetivo_delta_vs_base=("objetivo_delta_vs_base", "mean"),
+        )
+        .reset_index()
+    )
+    return grouped
+
+
 def export_excel_report(
     detail_df: pd.DataFrame,
     multipliers_df: pd.DataFrame,
@@ -238,11 +273,13 @@ def export_excel_report(
             columns=["year", "segment", "objetivo_mean", "profit_mean", "infra_cost_clp", "total_lanes"]
         )
     )
+    policy_summary_df = _build_policy_summary(detail_df)
     with pd.ExcelWriter(path) as writer:
         detail_df.to_excel(writer, index=False, sheet_name="plan_detalle")
         summary_df.to_excel(writer, index=False, sheet_name="resumen")
         multipliers_df.to_excel(writer, index=False, sheet_name="multipliers")
         initial_df.to_excel(writer, index=False, sheet_name="initial_policies")
+        policy_summary_df.to_excel(writer, index=False, sheet_name="policy_summary")
 
 
 def plot_objective_by_segment(detail_df: pd.DataFrame, path: Path) -> None:

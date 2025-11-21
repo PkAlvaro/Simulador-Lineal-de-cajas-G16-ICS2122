@@ -22,6 +22,7 @@ from tools.export_plan_report import (
     plot_total_lanes,
 )
 
+
 def _prompt_int(prompt: str, default: int) -> int:
     raw = input(f"{prompt} [{default}]: ").strip()
     if not raw:
@@ -64,7 +65,9 @@ def _coerce_lane_counts(entry) -> tuple[int, int, int, int]:
         except TypeError as exc:  # pragma: no cover - defensive
             raise ValueError("Formato de configuración inválido") from exc
     if len(seq) < len(LANE_ORDER):
-        raise ValueError("Se requieren valores para regular, express, priority y self_checkout")
+        raise ValueError(
+            "Se requieren valores para regular, express, priority y self_checkout"
+        )
     try:
         return tuple(int(max(0, seq[idx])) for idx in range(len(LANE_ORDER)))
     except (TypeError, ValueError) as exc:  # pragma: no cover - defensivo
@@ -75,7 +78,9 @@ def _load_base_seed_file(path: Path) -> dict[str, tuple[int, int, int, int]]:
     with path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
     if not isinstance(data, dict):
-        raise ValueError("El archivo debe contener un objeto JSON con claves por tipo de día")
+        raise ValueError(
+            "El archivo debe contener un objeto JSON con claves por tipo de día"
+        )
     seeds: dict[str, tuple[int, int, int, int]] = {}
     for key, value in data.items():
         key_norm = str(key).strip().upper()
@@ -262,13 +267,10 @@ def run_sequential_policy_plan() -> None:
     max_workers = _prompt_int("Cantidad de procesos en paralelo (0 = auto)", 0)
     max_workers = max_workers if max_workers > 0 else None
 
-    report_base_input = (
-        input(
-            "Carpeta base para exportar el reporte multi-anual "
-            f"[{DEFAULT_PLAN_REPORT_DIR}]: "
-        )
-        .strip()
-    )
+    report_base_input = input(
+        "Carpeta base para exportar el reporte multi-anual "
+        f"[{DEFAULT_PLAN_REPORT_DIR}]: "
+    ).strip()
     report_base_dir = (
         Path(report_base_input) if report_base_input else DEFAULT_PLAN_REPORT_DIR
     )
@@ -291,40 +293,17 @@ def run_sequential_policy_plan() -> None:
     max_evals = _prompt_int("Límite de evaluaciones por corrida (0 = sin límite)", 0)
     max_evals = max_evals if max_evals > 0 else None
 
-    recalc_base = (
-        input("¿Recalcular optimización del año base 2025? [S/n]: ")
+    single_policy_resp = (
+        input("¿Optimizar una única política válida para todos los años? [S/n]: ")
         .strip()
         .lower()
     )
-    optimize_base_year = recalc_base not in {"n", "no", "0"}
+    single_policy = single_policy_resp not in {"n", "no", "0"}
 
-    base_seed_map: dict[str, tuple[int, int, int, int]] | None = None
-    if not optimize_base_year:
-        seed_input = input(
-            "Ruta JSON con configuraciones iniciales (enter = usar valores por defecto): "
-        ).strip()
-        if seed_input:
-            seed_path = Path(seed_input)
-            if not seed_path.exists():
-                print(f"Archivo no encontrado: {seed_path}. Se usará la configuración por defecto.")
-            else:
-                try:
-                    raw_seeds = _load_base_seed_file(seed_path)
-                    base_seed_map = {}
-                    for dt in engine.DayType:
-                        for key in (dt.name.upper(), dt.value.upper()):
-                            if key in raw_seeds:
-                                base_seed_map[dt.name] = raw_seeds[key]
-                                break
-                    if not base_seed_map:
-                        print(
-                            "No se encontraron claves válidas en el JSON (TYPE_1/TYPE_2/TYPE_3 o tipo_1/...)."
-                        )
-                        base_seed_map = None
-                except Exception as exc:
-                    print(f"No se pudo cargar el archivo de configuraciones base: {exc}")
-                    base_seed_map = None
-
+    if single_policy:
+        print(
+            "\n[PLAN] Se optimizará una única política base que aplicará a todos los años y segmentos."
+        )
     print("\n[PLAN] Iniciando planificación secuencial multi-año...")
     try:
         result = plan_multi_year_optimization(
@@ -341,8 +320,7 @@ def run_sequential_policy_plan() -> None:
                 "max_seconds": max_seconds,
                 "max_eval_count": max_evals,
             },
-            optimize_base_year=optimize_base_year,
-            base_counts=base_seed_map,
+            single_investment=single_policy,
         )
     except Exception as exc:
         print(f"[ERROR] No se pudo completar la planificación: {exc}")

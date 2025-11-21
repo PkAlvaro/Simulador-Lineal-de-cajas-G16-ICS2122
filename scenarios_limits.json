@@ -1,0 +1,29 @@
+{
+  "scenarios": [
+    {
+      "label": "baseline_limits",
+      "express_max_items": null,
+      "sco_max_items": null
+    },
+    {
+      "label": "plus_5_items",
+      "express_max_items": 15,
+      "sco_max_items": 20
+    },
+    {
+      "label": "plus_10_items",
+      "express_max_items": 20,
+      "sco_max_items": 25
+    },
+    {
+      "label": "minus_5_items",
+      "express_max_items": 5,
+      "sco_max_items": 10
+    },
+    {
+      "label": "minus_10_items",
+      "express_max_items": 1,
+      "sco_max_items": 5
+    }
+  ]
+}

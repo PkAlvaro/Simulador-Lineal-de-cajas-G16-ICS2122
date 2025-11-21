@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
+from typing import Sequence
 
 import matplotlib
 
@@ -227,7 +228,10 @@ class EvalSAAResult:
     day_type: sim.DayType
 
 
-_FITNESS_CACHE: dict[tuple[int, int, int, int, sim.DayType], EvalSAAResult] = {}
+_FITNESS_CACHE: dict[tuple[tuple[int, int, int, int], sim.DayType, float], EvalSAAResult] = {}
+
+
+ScenarioWeight = tuple[str, float, float]
 
 
 def evaluate_policy_saa(
@@ -237,9 +241,40 @@ def evaluate_policy_saa(
     num_rep: int = 3,
     keep_outputs: bool = False,
     eval_context: str | None = None,
+    scenarios: Sequence[ScenarioWeight] | None = None,
+) -> EvalSAAResult:
+    if scenarios:
+        return _evaluate_policy_multi_scenarios(
+            x,
+            day_type=day_type,
+            num_weeks_sample=num_weeks_sample,
+            num_rep=num_rep,
+            keep_outputs=keep_outputs,
+            eval_context=eval_context,
+            scenarios=scenarios,
+        )
+    return _evaluate_policy_saa_single(
+        x,
+        day_type=day_type,
+        num_weeks_sample=num_weeks_sample,
+        num_rep=num_rep,
+        keep_outputs=keep_outputs,
+        eval_context=eval_context,
+    )
+
+
+def _evaluate_policy_saa_single(
+    x: tuple[int, int, int, int],
+    day_type: sim.DayType,
+    num_weeks_sample: int = 1,
+    num_rep: int = 3,
+    keep_outputs: bool = False,
+    eval_context: str | None = None,
 ) -> EvalSAAResult:
     x = tuple(int(v) for v in x)
-    key = x + (day_type,)
+    current_factor = float(sim.get_demand_multiplier())
+    factor_key = round(current_factor, 9)
+    key = (x, day_type, factor_key)
 
     if key in _FITNESS_CACHE:
         return _FITNESS_CACHE[key]
@@ -303,6 +338,71 @@ def evaluate_policy_saa(
     return res
 
 
+def _evaluate_policy_multi_scenarios(
+    x: tuple[int, int, int, int],
+    day_type: sim.DayType,
+    *,
+    num_weeks_sample: int,
+    num_rep: int,
+    keep_outputs: bool,
+    eval_context: str | None,
+    scenarios: Sequence[ScenarioWeight],
+) -> EvalSAAResult:
+    prev_factor = float(sim.get_demand_multiplier())
+    agg_profit = 0.0
+    agg_profit_std = 0.0
+    agg_obj = 0.0
+    agg_obj_std = 0.0
+    last_res: EvalSAAResult | None = None
+    total_weight = 0.0
+
+    try:
+        for label, factor, weight in scenarios:
+            weight_val = float(weight) if weight is not None else 1.0
+            if weight_val <= 0:
+                continue
+            total_weight += weight_val
+            sim.set_demand_multiplier(float(factor))
+            res = _evaluate_policy_saa_single(
+                x,
+                day_type=day_type,
+                num_weeks_sample=num_weeks_sample,
+                num_rep=num_rep,
+                keep_outputs=keep_outputs,
+                eval_context=(
+                    f"{eval_context} | escenario={label}" if eval_context else None
+                ),
+            )
+            last_res = res
+            agg_profit += weight_val * res.profit_mean
+            agg_profit_std += weight_val * res.profit_std
+            agg_obj += weight_val * res.objetivo_mean
+            agg_obj_std += weight_val * res.objetivo_std
+    finally:
+        sim.set_demand_multiplier(prev_factor)
+
+    if total_weight <= 0 or last_res is None:
+        sim.set_demand_multiplier(prev_factor)
+        return _evaluate_policy_saa_single(
+            x,
+            day_type=day_type,
+            num_weeks_sample=num_weeks_sample,
+            num_rep=num_rep,
+            keep_outputs=keep_outputs,
+            eval_context=eval_context,
+        )
+
+    return EvalSAAResult(
+        x=x,
+        objetivo_mean=float(agg_obj),
+        objetivo_std=float(agg_obj_std),
+        profit_mean=float(agg_profit),
+        profit_std=float(agg_profit_std),
+        n_rep=last_res.n_rep,
+        day_type=day_type,
+    )
+
+
 def generar_vecinos(
     x: tuple[int, int, int, int],
     max_total_lanes: int | None = None,
@@ -344,6 +444,7 @@ def construir_solucion_inicial_grasp(
     num_rep_saa: int = 1,
     max_total_lanes: int | None = None,
     context_label: str | None = None,
+    scenario_weights: Sequence[ScenarioWeight] | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
@@ -359,6 +460,7 @@ def construir_solucion_inicial_grasp(
         num_weeks_sample=num_weeks_sample,
         num_rep=num_rep_saa,
         eval_context=f"{base_context} | fase=GRASP | iter=0 (init)",
+        scenarios=scenario_weights,
     )
     _print_iteration_progress("GRASP", 0, best_eval)
 
@@ -391,6 +493,7 @@ def construir_solucion_inicial_grasp(
                     f"{base_context} | fase=GRASP | iter={step}"
                     f" | vecino={idx}/{total_vecinos}"
                 ),
+                scenarios=scenario_weights,
             )
             evals.append(ev)
 
@@ -438,6 +541,7 @@ def busqueda_local(
     T0: float = 1e6,
     cooling: float = 0.9,
     context_label: str | None = None,
+    scenario_weights: Sequence[ScenarioWeight] | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
@@ -450,6 +554,7 @@ def busqueda_local(
         num_weeks_sample=num_weeks_sample,
         num_rep=num_rep_saa,
         eval_context=f"{base_context} | fase=BUSQ | iter=0",
+        scenarios=scenario_weights,
     )
     best = current
     T = float(T0)
@@ -481,6 +586,7 @@ def busqueda_local(
                     f"{base_context} | fase=BUSQ | iter={iter_idx}"
                     f" | vecino={idx}/{total_vecinos}"
                 ),
+                scenarios=scenario_weights,
             )
             vec_evals.append(ev)
 
@@ -670,6 +776,7 @@ def optimizar_cajas_grasp_saa(
     max_eval_count: int | None = None,
     initial_solution: tuple[int, int, int, int] | None = None,
     context_label: str | None = None,
+    scenario_weights: Sequence[ScenarioWeight] | None = None,
 ) -> EvalSAAResult:
     global START_TIME, MAX_SECONDS, MAX_EVALS, EVAL_COUNT
     START_TIME = time.time()
@@ -697,6 +804,7 @@ def optimizar_cajas_grasp_saa(
                 num_rep=num_rep_saa_busqueda,
                 keep_outputs=False,
                 eval_context=f"{context_base} | fase=INIT_HEREDADA",
+                scenarios=scenario_weights,
             )
             imprimir_resumen_resultado(
                 x0_eval,
@@ -710,6 +818,7 @@ def optimizar_cajas_grasp_saa(
                 num_rep_saa=num_rep_saa_construccion,
                 max_total_lanes=max_total_lanes,
                 context_label=context_base,
+                scenario_weights=scenario_weights,
             )
             imprimir_resumen_resultado(
                 x0_eval,
@@ -735,6 +844,7 @@ def optimizar_cajas_grasp_saa(
             T0=1e6,
             cooling=0.85,
             context_label=context_base,
+            scenario_weights=scenario_weights,
         )
 
         imprimir_resumen_resultado(

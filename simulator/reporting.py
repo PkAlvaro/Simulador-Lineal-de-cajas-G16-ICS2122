@@ -19,6 +19,24 @@ except ImportError:  # pragma: no cover
 
 from . import engine
 
+HV_THRESHOLD_DEFAULT = 40
+HV_THRESHOLD_BY_PROFILE = {
+    "deal_hunter": 20,
+    "express_basket": 11,
+    "family_cart": 99,
+    "regular": 39,
+    "self_checkout_fan": 13,
+    "weekly_planner": 75,
+}
+
+
+def _high_volume_slice(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    prof_norm = df["profile"].astype(str).str.lower()
+    thresholds = prof_norm.map(HV_THRESHOLD_BY_PROFILE).fillna(HV_THRESHOLD_DEFAULT)
+    return df[df["items"] >= thresholds]
+
 
 def _reset_outputs_folder(root: Path) -> None:
     """
@@ -662,8 +680,8 @@ def run_full_workflow(
     tmc_display = tmc_df.copy()
     tmc_title = "TMC por perfil (estimado)"
     
-    # 5) TAC_HV (tasa de abandono alto volumen, items >= 40, estimada)
-    hv = df[df["items"] >= 40]
+    # 5) TAC_HV (tasa de abandono alto volumen por perfil, estimada)
+    hv = _high_volume_slice(df)
     hv_counts = hv[hv["outcome_norm"].isin(status_cols)].groupby(["profile", "outcome_norm"]).size().unstack(fill_value=0)
     hv_counts["total"] = hv_counts.sum(axis=1)
     hv_stats = hv_counts.assign(
@@ -809,7 +827,7 @@ def run_full_workflow(
         )
         tmc_teo["tmc_fmt"] = tmc_teo["tmc_wait_time_s"].map(lambda s: f"{s:.2f} s")
     
-        hv_teo = df_teo[df_teo["items"] >= 40]
+        hv_teo = _high_volume_slice(df_teo)
         if not hv_teo.empty:
             hv_teo_counts = hv_teo[hv_teo["outcome_norm"].isin(status_cols)].groupby(["profile", "outcome_norm"]).size().unstack(fill_value=0)
             hv_teo_counts["total"] = hv_teo_counts.sum(axis=1)

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -7,11 +7,6 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 from . import demand, engine
 from .engine import DayType, _warn
-
-try:  # re-export helper used por reportes y sensibilidad
-    from tools.export_plan_report import evaluate_base_performance as _evaluate_base_performance  # type: ignore
-except Exception:  # pragma: no cover
-    _evaluate_base_performance = None
 
 try:
     from optimizador_cajas import evaluate_policy_saa, optimizar_cajas_grasp_saa
@@ -34,30 +29,6 @@ LANE_ORDER: tuple[str, ...] = (
     "priority",
     "self_checkout",
 )
-
-
-def evaluate_base_performance(
-    sequential: SequentialOptimizationResult,
-    *,
-    num_weeks_sample: int,
-    num_rep: int,
-) -> Dict[tuple[str, str, str], Any]:
-    """
-    Wrapper fino para mantener compatibilidad con herramientas externas.
-
-    Delegamos en tools.export_plan_report.evaluate_base_performance para no
-    duplicar lógica. Si no está disponible, levantamos un error claro.
-    """
-    if _evaluate_base_performance is None:
-        raise RuntimeError(
-            "evaluate_base_performance no disponible; "
-            "verifica que tools/export_plan_report.py esté accesible"
-        )
-    return _evaluate_base_performance(
-        sequential,
-        num_weeks_sample=num_weeks_sample,
-        num_rep=num_rep,
-    )
 
 
 def _normalize_lane_tuple(raw: Any) -> tuple[int, int, int, int] | None:
@@ -191,10 +162,21 @@ def plan_multi_year_optimization(
         year_sequence = [str(year) for year in years]
 
     # --------------------------------------------------------------
-    # Optimización del año base (2025) - siempre se reoptimiza
-    # usando SOLO demanda base (factor 1.0, sin escenarios).
+    # OptimizaciÃ³n del aÃ±o base (2025) - siempre se reoptimiza
     # --------------------------------------------------------------
     engine.set_demand_multiplier(1.0)
+
+    scenario_weights: list[tuple[str, float, float]] | None = None
+    if single_investment:
+        # Promedio del factor por segmento para usar en la optimizaciÃ³n base
+        scenario_weights = []
+        for segment in segments:
+            seg_map = expectations.get(str(segment), {})
+            factors = [float(seg_map.get(str(year), 1.0)) for year in year_sequence]
+            if not factors:
+                continue
+            avg_factor = sum(factors) / len(factors)
+            scenario_weights.append((str(segment), avg_factor, float(len(factors))))
 
     eval_weeks_default = int(optimizer_kwargs.get("num_weeks_sample_busqueda") or 1)
     eval_reps_default = int(optimizer_kwargs.get("num_rep_saa_busqueda") or 1)
@@ -214,7 +196,13 @@ def plan_multi_year_optimization(
         context_label = f"Ano=2025 | Segmento=base | Dia={dt.name}"
         base_kwargs = dict(optimizer_kwargs)
         base_kwargs["context_label"] = context_label
-        base_tasks.append((dt.value, base_kwargs, None))
+        base_tasks.append(
+            (
+                dt.value,
+                base_kwargs,
+                scenario_weights if single_investment else None,
+            )
+        )
 
     base_results: dict[DayType, Any] = {}
     if len(base_tasks) == 1:
@@ -251,7 +239,7 @@ def plan_multi_year_optimization(
 
         base_seed_per_day[dt] = tuple(int(v) for v in result.x)
 
-    # Politicas iniciales heredadas por segmento/tipo de día
+    # Politicas iniciales heredadas por segmento/tipo de dÃ­a
     previous_solutions: Dict[str, Dict[DayType, tuple[int, int, int, int]]] = {
         str(segment): {dt: base_seed_per_day[dt] for dt in day_types}
         for segment in segments
@@ -261,12 +249,12 @@ def plan_multi_year_optimization(
 
     # ------------------------------------------------------------------
     # Modo "single_investment":
-    #   - Por cada segmento y tipo de día:
-    #       1) Optimizar cada año por separado (Stage 1).
-    #       2) Usar esas políticas (más la base) como candidatas y
-    #          elegir la que maximiza el objetivo acumulado a 5 años
-    #          evaluando año por año con evaluate_policy_saa (Stage 2).
-    #   - yearly_results se llena siempre con la política fija elegida.
+    #   - Por cada segmento y tipo de dÃ­a:
+    #       1) Optimizar cada aÃ±o por separado (Stage 1).
+    #       2) Usar esas polÃ­ticas (mÃ¡s la base) como candidatas y
+    #          elegir la que maximiza el objetivo acumulado a 5 aÃ±os
+    #          evaluando aÃ±o por aÃ±o con evaluate_policy_saa (Stage 2).
+    #   - yearly_results se llena siempre con la polÃ­tica fija elegida.
     # ------------------------------------------------------------------
     if single_investment:
         if evaluate_policy_saa is None:
@@ -281,7 +269,7 @@ def plan_multi_year_optimization(
             str, Dict[DayType, set[tuple[int, int, int, int]]]
         ] = {}
 
-        # Stage 1: optimizar años por separado
+        # Stage 1: optimizar aÃ±os por separado
         for segment in segments:
             seg_name = str(segment)
             print(f"\n[PLAN] Optimizando anos por separado para segmento {seg_name}...")
@@ -293,7 +281,7 @@ def plan_multi_year_optimization(
                 DayType, set[tuple[int, int, int, int]]
             ] = {dt: set() for dt in day_types}
 
-            # siempre incluir la política base como candidata
+            # siempre incluir la polÃ­tica base como candidata
             for dt in day_types:
                 base_policy = base_seed_per_day.get(dt)
                 if base_policy is not None:
@@ -335,7 +323,7 @@ def plan_multi_year_optimization(
 
             per_segment_candidates[seg_name] = candidate_policies
 
-        # Stage 2: elegir política fija por segmento y tipo de día
+        # Stage 2: elegir polÃ­tica fija por segmento y tipo de dÃ­a
         for segment in segments:
             seg_name = str(segment)
             seg_candidates = per_segment_candidates.get(seg_name, {})
@@ -410,7 +398,7 @@ def plan_multi_year_optimization(
 
     # ------------------------------------------------------------------
     # Modo normal (no single_investment): optimiza secuencialmente por
-    # segmento, año y tipo de día, heredando la solución anterior.
+    # segmento, aÃ±o y tipo de dÃ­a, heredando la soluciÃ³n anterior.
     # ------------------------------------------------------------------
     for segment in segments:
         seg_name = str(segment)
@@ -461,3 +449,4 @@ def plan_multi_year_optimization(
         },
         initial_policies={dt.name: base_seed_per_day[dt] for dt in day_types},
     )
+

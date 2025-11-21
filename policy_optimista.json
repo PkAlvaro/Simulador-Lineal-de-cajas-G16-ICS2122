@@ -1,0 +1,20 @@
+{
+  "TYPE_1": {
+    "regular": 13,
+    "express": 4,
+    "priority": 2,
+    "self_checkout": 5
+  },
+  "TYPE_2": {
+    "regular": 12,
+    "express": 2,
+    "priority": 3,
+    "self_checkout": 5
+  },
+  "TYPE_3": {
+    "regular": 16,
+    "express": 2,
+    "priority": 4,
+    "self_checkout": 5
+  }
+}
