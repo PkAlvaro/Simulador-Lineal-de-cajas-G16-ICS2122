@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import datetime as dt
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -10,6 +12,15 @@ try:
 except ImportError:  # pragma: no cover
     optimizar_cajas_grasp_saa = None
 
+from tools.export_plan_report import (
+    build_initial_policies_dataframe,
+    build_multipliers_dataframe,
+    build_plan_detail_dataframe,
+    evaluate_base_performance,
+    export_excel_report,
+    plot_objective_by_segment,
+    plot_total_lanes,
+)
 
 def _prompt_int(prompt: str, default: int) -> int:
     raw = input(f"{prompt} [{default}]: ").strip()
@@ -24,6 +35,8 @@ def _prompt_int(prompt: str, default: int) -> int:
 
 # Valores permitidos para mantener consistencia (1 semana o multiplos de 4 hasta 52)
 ALLOWED_WEEK_SAMPLES = [1] + [4 * i for i in range(1, 14)]  # 4..52
+LANE_ORDER = ("regular", "express", "priority", "self_checkout")
+DEFAULT_PLAN_REPORT_DIR = Path("resultados_opt")
 
 
 def _normalize_weeks_choice(weeks: int) -> int:
@@ -36,6 +49,94 @@ def _normalize_weeks_choice(weeks: int) -> int:
         f"se usara {closest} para mantener la consistencia (1 o multiplos de 4)."
     )
     return closest
+
+
+def _format_lane_tuple(counts: tuple[int, int, int, int]) -> str:
+    return ", ".join(f"{lane}={int(value)}" for lane, value in zip(LANE_ORDER, counts))
+
+
+def _coerce_lane_counts(entry) -> tuple[int, int, int, int]:
+    if isinstance(entry, dict):
+        seq = [entry.get(lane, entry.get(lane.upper(), 0)) for lane in LANE_ORDER]
+    else:
+        try:
+            seq = list(entry)
+        except TypeError as exc:  # pragma: no cover - defensive
+            raise ValueError("Formato de configuración inválido") from exc
+    if len(seq) < len(LANE_ORDER):
+        raise ValueError("Se requieren valores para regular, express, priority y self_checkout")
+    try:
+        return tuple(int(max(0, seq[idx])) for idx in range(len(LANE_ORDER)))
+    except (TypeError, ValueError) as exc:  # pragma: no cover - defensivo
+        raise ValueError("Los conteos de cajas deben ser números enteros") from exc
+
+
+def _load_base_seed_file(path: Path) -> dict[str, tuple[int, int, int, int]]:
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("El archivo debe contener un objeto JSON con claves por tipo de día")
+    seeds: dict[str, tuple[int, int, int, int]] = {}
+    for key, value in data.items():
+        key_norm = str(key).strip().upper()
+        if not key_norm:
+            continue
+        seeds[key_norm] = _coerce_lane_counts(value)
+    if not seeds:
+        raise ValueError("El archivo JSON no contiene configuraciones válidas")
+    return seeds
+
+
+def _generate_plan_report(
+    result,
+    *,
+    report_root: Path,
+    base_compare_weeks: int,
+    base_compare_reps: int,
+) -> None:
+    report_root = report_root.resolve()
+    timestamp = dt.datetime.now().strftime("plan_multi_year_%Y%m%d_%H%M%S")
+    target_dir = report_root / timestamp
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    base_compare_map = None
+    try:
+        print(
+            "[PLAN] Re-evaluando configuraciones base para comparativo "
+            f"({base_compare_weeks} semana(s), {base_compare_reps} réplica(s))..."
+        )
+        base_compare_map = evaluate_base_performance(
+            result,
+            num_weeks_sample=base_compare_weeks,
+            num_rep=base_compare_reps,
+        )
+    except Exception as exc:  # pragma: no cover - análisis defensivo
+        print(f"[WARN] No se pudo evaluar la configuración base: {exc}")
+
+    detail_df = build_plan_detail_dataframe(result, base_compare=base_compare_map)
+    multipliers_df = build_multipliers_dataframe(result)
+    initial_df = build_initial_policies_dataframe(result)
+
+    detail_path = target_dir / "plan_detalle.csv"
+    detail_df.to_csv(detail_path, index=False)
+
+    excel_path = target_dir / "plan_resumen.xlsx"
+    export_excel_report(detail_df, multipliers_df, initial_df, excel_path)
+
+    chart_obj_path = target_dir / "objetivo_por_segmento.png"
+    plot_objective_by_segment(detail_df, chart_obj_path)
+
+    chart_lanes_path = target_dir / "total_lanes_por_dia.png"
+    plot_total_lanes(detail_df, chart_lanes_path)
+
+    print("\n[PLAN] Reporte multi-anual generado automáticamente:")
+    print(f"  - Carpeta base: {target_dir}")
+    print(f"  - Detalle CSV: {detail_path.name}")
+    print(f"  - Planilla Excel: {excel_path.name}")
+    if chart_obj_path.exists():
+        print(f"  - Gráfico objetivo/segmento: {chart_obj_path.name}")
+    if chart_lanes_path.exists():
+        print(f"  - Gráfico cajas/tipo de día: {chart_lanes_path.name}")
 
 
 def run_sample_simulation() -> None:
@@ -113,6 +214,8 @@ def run_sequential_policy_plan() -> None:
         print(f"No se pudo importar policy_planner: {exc}")
         return
 
+    import simulator.engine as engine
+
     default_segmented = "demand_projection_2026_2030_segmented.csv"
     segmented_input = (
         input(f"Archivo segmentado [{default_segmented}]: ").strip()
@@ -159,10 +262,21 @@ def run_sequential_policy_plan() -> None:
     max_workers = _prompt_int("Cantidad de procesos en paralelo (0 = auto)", 0)
     max_workers = max_workers if max_workers > 0 else None
 
+    report_base_input = (
+        input(
+            "Carpeta base para exportar el reporte multi-anual "
+            f"[{DEFAULT_PLAN_REPORT_DIR}]: "
+        )
+        .strip()
+    )
+    report_base_dir = (
+        Path(report_base_input) if report_base_input else DEFAULT_PLAN_REPORT_DIR
+    )
+
     weeks_busqueda = _prompt_int("Semanas por evaluación en búsqueda local", 1)
     weeks_busqueda = _normalize_weeks_choice(max(1, weeks_busqueda))
 
-    reps_busqueda = _prompt_int("Repeticiones SAA por evaluación", 3)
+    reps_busqueda = _prompt_int("Repeticiones SAA por evaluación", 1)
     reps_busqueda = max(1, reps_busqueda)
 
     weeks_construccion = _prompt_int("Semanas por evaluación en fase GRASP", 1)
@@ -176,6 +290,40 @@ def run_sequential_policy_plan() -> None:
 
     max_evals = _prompt_int("Límite de evaluaciones por corrida (0 = sin límite)", 0)
     max_evals = max_evals if max_evals > 0 else None
+
+    recalc_base = (
+        input("¿Recalcular optimización del año base 2025? [S/n]: ")
+        .strip()
+        .lower()
+    )
+    optimize_base_year = recalc_base not in {"n", "no", "0"}
+
+    base_seed_map: dict[str, tuple[int, int, int, int]] | None = None
+    if not optimize_base_year:
+        seed_input = input(
+            "Ruta JSON con configuraciones iniciales (enter = usar valores por defecto): "
+        ).strip()
+        if seed_input:
+            seed_path = Path(seed_input)
+            if not seed_path.exists():
+                print(f"Archivo no encontrado: {seed_path}. Se usará la configuración por defecto.")
+            else:
+                try:
+                    raw_seeds = _load_base_seed_file(seed_path)
+                    base_seed_map = {}
+                    for dt in engine.DayType:
+                        for key in (dt.name.upper(), dt.value.upper()):
+                            if key in raw_seeds:
+                                base_seed_map[dt.name] = raw_seeds[key]
+                                break
+                    if not base_seed_map:
+                        print(
+                            "No se encontraron claves válidas en el JSON (TYPE_1/TYPE_2/TYPE_3 o tipo_1/...)."
+                        )
+                        base_seed_map = None
+                except Exception as exc:
+                    print(f"No se pudo cargar el archivo de configuraciones base: {exc}")
+                    base_seed_map = None
 
     print("\n[PLAN] Iniciando planificación secuencial multi-año...")
     try:
@@ -193,6 +341,8 @@ def run_sequential_policy_plan() -> None:
                 "max_seconds": max_seconds,
                 "max_eval_count": max_evals,
             },
+            optimize_base_year=optimize_base_year,
+            base_counts=base_seed_map,
         )
     except Exception as exc:
         print(f"[ERROR] No se pudo completar la planificación: {exc}")
@@ -200,7 +350,13 @@ def run_sequential_policy_plan() -> None:
 
     print("\n=== RESULTADOS BASE (Año 2025) ===")
     for dt, res in result.base_year.items():
-        _print_optimizer_summary(res)
+        if getattr(res, "n_rep", None) == 0:
+            counts_str = _format_lane_tuple(tuple(int(v) for v in res.x))
+            print(
+                f"[RESUMEN {dt.name}] x={res.x} ({counts_str}) | Configuración base aplicada (sin reoptimizar)"
+            )
+        else:
+            _print_optimizer_summary(res)
 
     for year, per_segment in result.yearly.items():
         print(f"\n=== RESULTADOS AÑO {year} ===")
@@ -215,6 +371,23 @@ def run_sequential_policy_plan() -> None:
             f"{year}:{value:.4f}" for year, value in sorted(mapping.items())
         )
         print(f"{segment}: {formatted}")
+
+    if result.initial_policies:
+        print("\nConfiguraciones iniciales utilizadas:")
+        for day_name, counts in result.initial_policies.items():
+            print(f"  {day_name}: {counts} ({_format_lane_tuple(counts)})")
+
+    try:
+        compare_weeks = max(1, weeks_busqueda)
+        compare_reps = max(1, reps_busqueda)
+        _generate_plan_report(
+            result,
+            report_root=report_base_dir,
+            base_compare_weeks=compare_weeks,
+            base_compare_reps=compare_reps,
+        )
+    except Exception as exc:  # pragma: no cover - defensivo
+        print(f"[WARN] No se pudo generar el reporte automático: {exc}")
 
     print("\nPlanificación completada.")
 

@@ -5,6 +5,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import uuid
 
 import matplotlib
 
@@ -253,7 +254,10 @@ def evaluate_policy_saa(
         seed = 12345 + 10000 * rep + 101 * x[0] + 17 * x[1] + 7 * x[2] + 3 * x[3]
         _set_global_random_seeds(seed)
 
-        run_id = f"{day_type.name}_x_{x[0]}_{x[1]}_{x[2]}_{x[3]}_rep{rep}"
+        unique_tag = uuid.uuid4().hex[:8]
+        run_id = (
+            f"{day_type.name}_x_{x[0]}_{x[1]}_{x[2]}_{x[3]}_" f"rep{rep}_{unique_tag}"
+        )
         run_context = eval_context or f"Dia={day_type.name}"
         obj, prof = _evaluate_policy_once(
             x,

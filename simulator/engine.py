@@ -1,8 +1,5 @@
-# %% [markdown]
 # # Simulador caso base lineal de cajas
 
-# %%
-# LibrerÃ­as
 import os, csv, datetime, pickle, ast, inspect, time, json
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -16,16 +13,6 @@ import pandas as pd
 from scipy import stats
 from scipy import stats as scipy_stats
 
-# para que lea los display del jupyter
-try:
-    from IPython.display import display
-except ImportError:
-
-    def display(x):
-        print(x)
-
-
-# %%
 # Constantes globales
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT
@@ -71,7 +58,6 @@ def get_demand_multiplier() -> float:
     return _DEMAND_SCALING_FACTOR
 
 
-# %%
 # Clases base
 class CustomerProfile(Enum):
     DEAL_HUNTER = "deal_hunter"
@@ -107,7 +93,6 @@ class LaneType(Enum):
     SCO = "sco"
 
 
-# %%
 MAX_TOTAL_LANES = 40
 EXPRESS_BLOCK = None  # express lanes are free, kept for clarity
 SCO_BLOCK = 5
@@ -178,6 +163,7 @@ PATIENCE_DISTRIBUTION_FILE = (
 )
 PATIENCE_BASE_CSV_FILE = PATIENCE_DISTRIBUTION_FILE
 _PATIENCE_TABLE_ANNOUNCED = False
+_PATIENCE_SAMPLER_INSTANCE = None
 DEFAULT_LANE_COUNTS = {
     DayType.TYPE_1: {"regular": 10, "express": 3, "priority": 2, "self_checkout": 5},
     DayType.TYPE_2: {"regular": 10, "express": 3, "priority": 2, "self_checkout": 5},
@@ -399,10 +385,8 @@ LANE_COST_BY_DAYTYPE_STR = {
 }
 
 
-# %% [markdown]
 # Cargando tasas de llegada desde npz generados por tools/rebuild_arrivals.py.
 
-# %%
 ARRIVALS_NPZ_DIR = PROJECT_ROOT / "arrivals_npz"
 _ARRIVAL_FILES = {
     CustomerProfile.DEAL_HUNTER: ARRIVALS_NPZ_DIR / "lambda_deal_hunter.npz",
@@ -485,11 +469,9 @@ def _lambda_step_at(seconds: float, times: np.ndarray, lambdas: np.ndarray) -> f
     return float(lambdas[i])
 
 
-# %% [markdown]
 # ## Tiempos de llegada de clientes
 
 
-# %%
 @dataclass
 class ArrivalDistribution:
     profile: CustomerProfile
@@ -510,10 +492,8 @@ class ArrivalDistribution:
         return (_DEMAND_SCALING_FACTOR * lambda_por_minuto) / 60.0
 
 
-# %% [markdown]
 # ## Mapeo de tipos de dÃ­a
 
-# %%
 _SEG_DAY_MAP = {
     "tipo 1": DayType.TYPE_1,
     "tipo 2": DayType.TYPE_2,
@@ -573,10 +553,8 @@ def _normalize_day_type_value(value) -> Optional[DayType]:
     return _norm_enum(text, DayType)
 
 
-# %% [markdown]
 # ## Volumen de compra
 
-# %%
 ITEMS_SUMMARY_FILE = PROJECT_ROOT / "items_distribution_summary.csv"
 RNG_ITEMS = np.random.default_rng(123)
 
@@ -786,7 +764,6 @@ def _resolve_item_spec(
     return None
 
 
-# %%
 def draw_items(
     profile,
     priority: Optional[PriorityType] = None,
@@ -814,10 +791,8 @@ def draw_items(
     return int(max(1, spec.sample(rng)))
 
 
-# %% [markdown]
 # ## Paciencia de los clientes
 
-# %%
 import re
 
 
@@ -1047,7 +1022,6 @@ def _load_patience_rules_from_csv(path: str | Path) -> _PatienceRuleStore:
     return store
 
 
-# %%
 @dataclass
 class PatienceDistributionExponential:
     def sample(
@@ -1272,6 +1246,10 @@ class PatienceDistributionTable:
 
 
 def _build_patience_sampler():
+    global _PATIENCE_SAMPLER_INSTANCE
+    if _PATIENCE_SAMPLER_INSTANCE is not None:
+        return _PATIENCE_SAMPLER_INSTANCE
+
     try:
         base_fallback = PatienceDistributionCSV()
         base_csv_path = Path(base_fallback.source_file)
@@ -1291,9 +1269,10 @@ def _build_patience_sampler():
                     PATIENCE_DISTRIBUTION_FILE,
                 )
                 _PATIENCE_TABLE_ANNOUNCED = True
-            return PatienceDistributionTable(
+            _PATIENCE_SAMPLER_INSTANCE = PatienceDistributionTable(
                 PATIENCE_DISTRIBUTION_FILE, fallback=base_fallback
             )
+            return _PATIENCE_SAMPLER_INSTANCE
         except Exception as exc:
             _warn(
                 f"No se pudo cargar el archivo de paciencia; se usara el CSV tradicional ({exc})",
@@ -1304,7 +1283,8 @@ def _build_patience_sampler():
             "Archivo de paciencia reconstruido no encontrado, se usara el CSV tradicional",
             PATIENCE_DISTRIBUTION_FILE,
         )
-    return base_fallback
+    _PATIENCE_SAMPLER_INSTANCE = base_fallback
+    return _PATIENCE_SAMPLER_INSTANCE
 
 
 @dataclass
@@ -1333,10 +1313,8 @@ class ProfileConfig:
         )
 
 
-# %% [markdown]
 # ## Tiempo de servicio por cliente
 
-# %%
 _PRIORITY_QUEUE_RANK = {
     PriorityType.REDUCED_MOBILITY: 0,
     PriorityType.SENIOR: 0,
@@ -1387,7 +1365,6 @@ SLOW_PROFILES = {
     CustomerProfile.WEEKLY_PLANNER,
 }
 
-# %%
 _DIST = {
     "normal": stats.norm,
     "lognorm": stats.lognorm,
@@ -1617,15 +1594,19 @@ class ServiceTimeFactorModel:
         self, profile, priority, payment_method, day_type, lane_type, items: float
     ) -> float:
         total = self.intercept + self.items_coef * float(max(0.0, items))
-        context = {
-            "profile": profile,
-            "priority": priority,
-            "payment_method": payment_method,
-            "lane_type": lane_type,
-            "day_type": day_type,
-        }
-        for column in SERVICE_TIME_CATEGORY_COLUMNS:
-            total += self._category_adjustment(column, context[column])
+        if not self.categories:
+            return float(max(0.0, total))
+
+        if "profile" in self.categories:
+            total += self._category_adjustment("profile", profile)
+        if "priority" in self.categories:
+            total += self._category_adjustment("priority", priority)
+        if "payment_method" in self.categories:
+            total += self._category_adjustment("payment_method", payment_method)
+        if "lane_type" in self.categories:
+            total += self._category_adjustment("lane_type", lane_type)
+        if "day_type" in self.categories:
+            total += self._category_adjustment("day_type", day_type)
         return float(max(0.0, total))
 
     def _multiplier_for(self, lane_type, profile) -> float:
@@ -1689,11 +1670,9 @@ else:
     SERVICE_TIME_MODEL = None
 
 
-# %% [markdown]
 # ## Balking
 
 
-# %%
 class QueueCapBalkModel:
     """
     Balking determinÃ­stico basado en un mÃ¡ximo de largo de cola efectivo por perfil.
@@ -1727,7 +1706,6 @@ class QueueCapBalkModel:
         return self.prob_balk(*args, **kwargs) >= 1.0
 
 
-# %%
 balk_model = QueueCapBalkModel(
     caps={
         CustomerProfile.FAMILY_CART: 10**6,
@@ -1739,10 +1717,8 @@ balk_model = QueueCapBalkModel(
 BALK_MODEL = balk_model
 
 
-# %% [markdown]
 # ## RelaciÃ³n de profit
 
-# %%
 # === Celda: parÃ¡metros de profit con coeficientes por Ã­tems ===
 import csv
 import json
@@ -1855,6 +1831,8 @@ def _profit_noise(entry: dict, rng: Optional[np.random.Generator]) -> float:
             std = std * math.sqrt(math.pi / 2.0)
     if not (np.isfinite(std) and std > 0):
         return 0.0
+    if "_PROFIT_NOISE_POOL" in globals():
+        return _PROFIT_NOISE_POOL.draw(std)
     rng = rng or RNG_PROFIT
     if isinstance(rng, np.random.Generator):
         return float(rng.normal(0.0, std))
@@ -1896,11 +1874,29 @@ def sample_profit(
     return int(round(max(0.0, profit)))
 
 
-# %%
 # === Celda: integraciÃ³n en el evento de checkout ===
 # supuestos: objeto customer con atributos .profile y .items
 if "RNG_PROFIT" not in globals():
     RNG_PROFIT = np.random.default_rng(42)
+
+
+class _NormalNoisePool:
+    def __init__(self, rng: np.random.Generator, batch_size: int = 2048):
+        self.rng = rng
+        self.batch_size = max(16, int(batch_size))
+        self._buffer = np.empty(0, dtype=float)
+
+    def draw(self, std: float) -> float:
+        if not (np.isfinite(std) and std > 0):
+            return 0.0
+        if self._buffer.size <= 0:
+            self._buffer = self.rng.normal(0.0, 1.0, size=self.batch_size)
+        val = self._buffer[-1]
+        self._buffer = self._buffer[:-1]
+        return float(std * val)
+
+
+_PROFIT_NOISE_POOL = _NormalNoisePool(RNG_PROFIT)
 
 
 def finalize_customer_profit(
@@ -1921,7 +1917,6 @@ def finalize_customer_profit(
     )
 
 
-# %%
 # df_events: columnas mÃ­nimas ['profile','items'] y opcionales ['priority','payment_method','day_type']
 def compute_profit_column(
     df_events: pd.DataFrame,
@@ -1953,10 +1948,8 @@ def compute_profit_column(
 # df_events["total_profit_clp"] = compute_profit_column(df_events)
 
 
-# %% [markdown]
 # # GeneraciÃ³n de clientes y simulaciÃ³n
 
-# %%
 # ===================== CSV schemas =====================
 CUSTOMERS_FIELDS = [
     "source_folder",
@@ -2124,7 +2117,6 @@ def lookup_balking_threshold(
     return None
 
 
-# %%
 def spawn_customer(
     env, lanes, cliente, time_log, customers_rows, balk_model=None, day_type=None
 ):
@@ -2229,24 +2221,36 @@ def spawn_customer(
             return 1  # hay servicio pero queda un puesto libre
         return 2  # resto de casos
 
-    def tiempo_estimado_espera(lane: "CheckoutLane") -> float:
-        cap = max(1, getattr(lane, "capacity", 1))
-        ahead = max(0.0, float(lane._eff))
-        servicio_prom = float(max(1.0, 15.0 + 4.0 * int(cliente["items"])))
+    base_servicio_default = float(max(1.0, 15.0 + 4.0 * int(cliente["items"])))
+    servicio_cache: dict[LaneType, float] = {}
+
+    def _servicio_estimado_lane(lane_type: LaneType) -> float:
+        cached = servicio_cache.get(lane_type)
+        if cached is not None:
+            return cached
+        servicio_prom = base_servicio_default
         if "SERVICE_TIME_MODEL" in globals():
             try:
                 servicio_prom = SERVICE_TIME_MODEL.expected_value(
                     profile=cliente["profile"],
                     items=int(cliente["items"]),
-                    lane_type=lane.lane_type,
+                    lane_type=lane_type,
                     priority=cliente["priority"],
                     payment_method=cliente["payment_method"],
                     day_type=cliente.get("day_type"),
                 )
                 if not (np.isfinite(servicio_prom) and servicio_prom > 0):
-                    servicio_prom = float(max(1.0, 15.0 + 4.0 * int(cliente["items"])))
+                    servicio_prom = base_servicio_default
             except Exception:
-                servicio_prom = float(max(1.0, 15.0 + 4.0 * int(cliente["items"])))
+                servicio_prom = base_servicio_default
+        servicio_prom = float(max(1.0, servicio_prom))
+        servicio_cache[lane_type] = servicio_prom
+        return servicio_prom
+
+    def tiempo_estimado_espera(lane: "CheckoutLane") -> float:
+        cap = max(1, getattr(lane, "capacity", 1))
+        ahead = max(0.0, float(lane._eff))
+        servicio_prom = _servicio_estimado_lane(lane.lane_type)
         return (ahead / cap) * servicio_prom
 
     # 2) elegir caja priorizando vacÃ­as, luego con hueco, luego cola efectiva
@@ -2560,11 +2564,67 @@ def spawn_customer(
         customers_rows.append(registro)
 
 
-# %%
 from pathlib import Path
 
 
 LAMBDA_MATRIX_DTYPE = np.float32
+_LAMBDA_ROW_CACHE: dict[tuple[str, str, str, str, int], np.ndarray] = {}
+
+
+def _lambda_row_cache_key(dist: ArrivalDistribution, day_len: int) -> tuple[str, ...]:
+    profile = getattr(dist.profile, "value", str(dist.profile))
+    day_type = getattr(dist.day_type, "value", str(dist.day_type))
+    priority = getattr(dist.priority, "value", str(dist.priority))
+    payment = getattr(dist.payment_method, "value", str(dist.payment_method))
+    return (str(profile), str(day_type), str(priority), str(payment), int(day_len))
+
+
+def _compute_lambda_row(
+    dist: ArrivalDistribution,
+    day_len: int,
+    per_profile_series: dict[CustomerProfile, dict],
+) -> np.ndarray:
+    cache_key = _lambda_row_cache_key(dist, day_len)
+    cached = _LAMBDA_ROW_CACHE.get(cache_key)
+    if cached is not None and cached.shape[0] == day_len + 1:
+        return cached
+
+    ser = per_profile_series.get(dist.profile)
+    if ser is None:
+        ser = _get_series_for_profile(dist.profile)
+        per_profile_series[dist.profile] = ser
+
+    pair = ser.get((dist.day_type, dist.priority, dist.payment_method))
+    if not pair:
+        row = np.zeros(day_len + 1, dtype=LAMBDA_MATRIX_DTYPE)
+        _LAMBDA_ROW_CACHE[cache_key] = row
+        return row
+
+    t, lam = pair
+    t = np.asarray(t, dtype=int)
+    lam_sec = (
+        np.maximum(np.asarray(lam, dtype=LAMBDA_MATRIX_DTYPE), 0.0)
+        / np.float32(60.0)
+    )
+
+    if t[0] > 0:
+        t = np.insert(t, 0, 0)
+        lam_sec = np.insert(lam_sec, 0, lam_sec[0])
+    if t[-1] < day_len:
+        t = np.append(t, day_len)
+        lam_sec = np.append(lam_sec, lam_sec[-1])
+
+    lengths = np.diff(np.append(t, day_len + 1))
+    row = np.repeat(lam_sec, lengths)[: day_len + 1]
+    if row.shape[0] < (day_len + 1):
+        row = np.pad(
+            row, (0, (day_len + 1) - row.shape[0]), mode="edge"
+        ).astype(LAMBDA_MATRIX_DTYPE, copy=False)
+    else:
+        row = row.astype(LAMBDA_MATRIX_DTYPE, copy=False)
+
+    _LAMBDA_ROW_CACHE[cache_key] = row
+    return row
 
 
 # OptimizaciÃ³n: precomputar una matriz de lambdas por segundo para todas
@@ -2584,39 +2644,8 @@ def _build_lambda_matrix(combos: list[tuple], day_len: int) -> np.ndarray:
     matriz = np.zeros((n, day_len + 1), dtype=LAMBDA_MATRIX_DTYPE)
 
     for idx, (_, _, _, dist) in enumerate(combos):
-        # Cachear series por perfil para evitar I/O repetido
-        ser = per_profile_series.get(dist.profile)
-        if ser is None:
-            ser = _get_series_for_profile(dist.profile)
-            per_profile_series[dist.profile] = ser
-
-        pair = ser.get((dist.day_type, dist.priority, dist.payment_method))
-        if not pair:
-            continue
-
-        t, lam = pair
-        # t en segundos, lam en "por minuto". Queremos por segundo.
-        t = np.asarray(t, dtype=int)
-        lam_sec = np.maximum(
-            np.asarray(lam, dtype=LAMBDA_MATRIX_DTYPE), 0.0
-        ) / np.float32(60.0)
-
-        # Asegurar que cubrimos [0, day_len]
-        if t[0] > 0:
-            t = np.insert(t, 0, 0)
-            lam_sec = np.insert(lam_sec, 0, lam_sec[0])
-        if t[-1] < day_len:
-            t = np.append(t, day_len)
-            lam_sec = np.append(lam_sec, lam_sec[-1])
-
-        # Rellenar por tramos: para s en [t[i], t[i+1]) usar lam_sec[i]
-        lengths = np.diff(np.append(t, day_len + 1))
-        row = np.repeat(lam_sec, lengths)[: day_len + 1]
-        if row.shape[0] < (day_len + 1):
-            # Padding defensivo si algo quedÃ³ corto por redondeos
-            row = np.pad(row, (0, (day_len + 1) - row.shape[0]), mode="edge")
-
-        matriz[idx, :] = row.astype(LAMBDA_MATRIX_DTYPE, copy=False)
+        row = _compute_lambda_row(dist, day_len, per_profile_series)
+        matriz[idx, :] = row
 
     return matriz
 
@@ -2696,6 +2725,11 @@ def _simular_dia_periodo(
     # Precompute matriz de tasas por segundo para acelerar el bucle
     JORNADA = int(CLOSE_S - OPEN_S)
     lam_mat = _build_lambda_matrix(combos, JORNADA)
+    # Serie auxiliar para saltar tramos completos sin llegadas.
+    if lam_mat.size:
+        active_seconds = np.flatnonzero(lam_mat.sum(axis=0) > 0).astype(int)
+    else:
+        active_seconds = np.empty(0, dtype=int)
 
     while t < t1:
         if t > t1:
@@ -2711,6 +2745,14 @@ def _simular_dia_periodo(
         dt_cap = min((BIN_SEC - resto) if resto != 0 else BIN_SEC, t1 - t)
 
         if Lambda <= 0.0 or dt_cap <= 0:
+            if Lambda <= 0.0 and active_seconds.size:
+                # Salta directamente al proximo segundo con tasa positiva.
+                next_pos = np.searchsorted(active_seconds, sec_idx + 1)
+                if next_pos < active_seconds.size:
+                    t = OPEN_S + float(active_seconds[next_pos])
+                    continue
+                t = t1
+                break
             t += max(dt_cap, 1.0)
             continue
 
@@ -2960,8 +3002,6 @@ def simulacion_anual_completa(output_root: str = "outputs") -> list[dict]:
     )
 
 
-# %%
-# %%
 # EjecuciÃ³n principal: simulamos solo algunas semanas y extrapolamos a un aÃ±o
 
 if __name__ == "__main__":
