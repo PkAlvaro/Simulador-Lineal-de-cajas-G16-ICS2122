@@ -1,7 +1,7 @@
 outputs/
-outputs_anual/
-outputs_sample/
-outputs_teoricos/
+outputs_anual/*
+outputs_sample/*
+outputs_teoricos/*
 resultados/
 pycache__/
 __pycache__/

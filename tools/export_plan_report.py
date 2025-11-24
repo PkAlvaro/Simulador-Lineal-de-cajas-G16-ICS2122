@@ -24,7 +24,7 @@ from simulator.policy_planner import (  # noqa: E402
     SequentialOptimizationResult,
     plan_multi_year_optimization,
 )
-from optimizador_cajas import cost_anual_config, evaluate_policy_saa  # noqa: E402
+from simulator.optimizador_cajas import cost_anual_config, evaluate_policy_saa  # noqa: E402
 
 
 def _parse_list(arg: str | None) -> list[str] | None:

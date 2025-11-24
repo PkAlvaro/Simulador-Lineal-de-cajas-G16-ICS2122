@@ -8,7 +8,7 @@ from pathlib import Path
 from . import reporting
 
 try:
-    from optimizador_cajas import optimizar_cajas_grasp_saa
+    from .optimizador_cajas import optimizar_cajas_grasp_saa
 except ImportError:  # pragma: no cover
     optimizar_cajas_grasp_saa = None
 
@@ -173,13 +173,25 @@ def run_optimizer() -> None:
     max_seconds = max_seconds if max_seconds > 0 else None
     max_evals = _prompt_int("Limite de evaluaciones (0 = sin limite)", 0)
     max_evals = max_evals if max_evals > 0 else None
+    keep_outputs_resp = (
+        input("¿Guardar outputs de cada evaluacion? (modo rapido = no) [n]: ")
+        .strip()
+        .lower()
+    )
+    keep_outputs = keep_outputs_resp in {"s", "si", "y", "yes"}
+    use_in_memory = not keep_outputs
 
     if mode == "2":
         day_values = [dt.value for dt in engine.DayType]
         with ProcessPoolExecutor(max_workers=len(day_values)) as pool:
             futures = {
                 pool.submit(
-                    _optimizer_worker, day_value, max_seconds, max_evals
+                    _optimizer_worker,
+                    day_value,
+                    max_seconds,
+                    max_evals,
+                    keep_outputs,
+                    use_in_memory,
                 ): day_value
                 for day_value in day_values
             }
@@ -202,6 +214,8 @@ def run_optimizer() -> None:
             max_seconds=max_seconds,
             max_eval_count=max_evals,
             context_label=f"CLI | Día={day.name}",
+            keep_outputs_eval=keep_outputs,
+            use_in_memory=use_in_memory,
         )
         _print_optimizer_summary(result)
 
@@ -221,7 +235,7 @@ def run_sequential_policy_plan() -> None:
 
     import simulator.engine as engine
 
-    default_segmented = "demand_projection_2026_2030_segmented.csv"
+    default_segmented = "data/demand_projection_2026_2030_segmented.csv"
     segmented_input = (
         input(f"Archivo segmentado [{default_segmented}]: ").strip()
         or default_segmented
@@ -370,9 +384,15 @@ def run_sequential_policy_plan() -> None:
     print("\nPlanificación completada.")
 
 
-def _optimizer_worker(day_value: str, max_seconds: int | None, max_evals: int | None):
+def _optimizer_worker(
+    day_value: str,
+    max_seconds: int | None,
+    max_evals: int | None,
+    keep_outputs: bool,
+    use_in_memory: bool,
+):
     import simulator.engine as engine
-    from optimizador_cajas import optimizar_cajas_grasp_saa as worker_opt
+    from simulator.optimizador_cajas import optimizar_cajas_grasp_saa as worker_opt
 
     day = next(dt for dt in engine.DayType if dt.value == day_value)
     return worker_opt(
@@ -380,6 +400,8 @@ def _optimizer_worker(day_value: str, max_seconds: int | None, max_evals: int | 
         max_seconds=max_seconds,
         max_eval_count=max_evals,
         context_label=f"CLI|POOL | Día={day.name}",
+        keep_outputs_eval=keep_outputs,
+        use_in_memory=use_in_memory,
     )
 
 

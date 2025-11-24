@@ -13,17 +13,21 @@ Este repositorio contiene el simulador integral de cajas de supermercado (Proyec
   - `rebuild_arrivals.py`: genera los `.npz` de lambdas por perfil/prioridad/medio de pago/día. Cuenta con la opción `--apply-little` para escalar las tasas de llegada usando la ley de Little.
   - `calc_service_time_multipliers.py`: calcula multiplicadores por `(lane_type, profile)` comparando los tiempos teóricos vs. la predicción del modelo `service_time_model.json`. El resultado se guarda en `service_time/service_time_multipliers.csv` y se aplica automáticamente en el simulador.
   - `run_sensitivity_plan.py`: ejecuta un análisis de sensibilidad variando los límites de ítems para cajas rápidas y *self-checkout* bajo distintos escenarios definidos en un JSON.
-- `arrivals_npz/`: lambdas PPNH por perfil (se generan con el script anterior).
-- `service_time/`: definiciones del modelo de tiempo de servicio y los multiplicadores.
-- `patience/`: distribuciones de paciencia (por perfil, prioridad y medio de pago) que se cargan en cada corrida.
-- `optimizador_cajas.py`: optimizador GRASP+SAA+ búsqueda local que usa el simulador para evaluar configuraciones de cajas por tipo de día, calculando el objetivo `profit anual estimado – costo anual`.
+- `simulator/optimizador_cajas.py`: optimizador GRASP+SAA+ búsqueda local que usa el simulador para evaluar configuraciones de cajas por tipo de día, calculando el objetivo `profit anual estimado – costo anual`.
+- `Analisis/`: Notebooks de Jupyter para análisis y visualización.
+- `data/`: Contiene todos los datos de entrada y configuración del simulador:
+  - `arrivals_npz/`: lambdas PPNH por perfil.
+  - `service_time/`: definiciones del modelo de tiempo de servicio y los multiplicadores.
+  - `patience/`: distribuciones de paciencia.
+  - `config/`: Archivos de configuración (e.g., `scenarios_limits.json`).
+- `archive/`: Archivos antiguos o en desuso.
 
 ## Flujo de calibración
 
 1. **Datos teóricos**: descargar/actualizar `outputs_teoricos/Week-*-Day-*/` (contienen los archivos `customers.csv` y `time_log.csv` reales).
 2. **Reconstruir lambdas PPNH**:
    ```bash
-   python tools/rebuild_arrivals.py --root outputs_teoricos --output-dir arrivals_npz
+   python tools/rebuild_arrivals.py --root outputs_teoricos --output-dir data/arrivals_npz
    # Opcional: escalar las series usando Little
    python tools/rebuild_arrivals.py --apply-little
    ```
@@ -31,8 +35,8 @@ Este repositorio contiene el simulador integral de cajas de supermercado (Proyec
    ```bash
    python tools/calc_service_time_multipliers.py \
        --root outputs_teoricos \
-       --model service_time/service_time_model.json \
-       --output service_time/service_time_multipliers.csv
+       --model data/service_time/service_time_model.json \
+       --output data/service_time/service_time_multipliers.csv
    ```
    El simulador leerá automáticamente ese archivo y ajustará los tiempos según `(lane_type, profile)`.
 4. **Ejecutar simulación** (menú principal):
@@ -56,7 +60,7 @@ Para evaluar el impacto de cambiar los límites de productos en cajas Express y 
 
 ```bash
 python tools/run_sensitivity_plan.py \
-    --scenarios scenarios_limits.json \
+    --scenarios config/scenarios_limits.json \
     --segments pesimista,regular,optimista \
     --output-dir resultados_sensibilidad
 ```
@@ -65,6 +69,6 @@ Esto generará reportes comparativos en `resultados_sensibilidad/` para cada esc
 
 ## Notas adicionales
 
-- El motor usa los `.npz` de `arrivals_npz/` (no PKL). Asegúrate de regenerarlos cuando existan cambios en la base teórica.
+- El motor usa los `.npz` de `data/arrivals_npz/` (no PKL). Asegúrate de regenerarlos cuando existan cambios en la base teórica.
 - Los scripts de calibración están pensados para correrse **antes** de la simulación y no dependen de los resultados de esa corrida; así los multiplicadores y tasas permanecen estables.
 - El optimizador usa el mismo motor (no hay “simulador paralelo”). Todas las políticas x = (regular, express, priority, self_checkout) se aplican mediante `enforce_lane_constraints` y `update_current_lane_policy`.

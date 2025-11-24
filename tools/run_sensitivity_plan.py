@@ -174,14 +174,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--segmented",
         type=Path,
-        default=Path("demand_projection_2026_2030_segmented.csv"),
-        help="CSV segmentado con demanda (default: demand_projection_2026_2030_segmented.csv).",
+        default=Path("data/demand_projection_2026_2030_segmented.csv"),
+        help="CSV segmentado con demanda (default: data/demand_projection_2026_2030_segmented.csv).",
     )
     parser.add_argument(
         "--fit-summary",
         type=Path,
-        default=Path("demand_projection_2026_2030_segmented_fit_summary.csv"),
-        help="CSV con ajustes estadísticos (default: *_fit_summary.csv).",
+        default=Path("data/demand_projection_2026_2030_segmented_fit_summary.csv"),
+        help="CSV con ajustes estadísticos (default: data/*_fit_summary.csv).",
     )
     parser.add_argument(
         "--segments",

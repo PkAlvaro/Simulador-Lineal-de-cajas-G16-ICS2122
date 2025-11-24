@@ -16,7 +16,7 @@ from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 import sys
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -119,7 +119,7 @@ def _load_annual_costs_from_csv(csv_path: Path) -> dict[str, float]:
     return costs
 
 
-COSTS_CSV_PATH = PROJECT_ROOT / "costos_cajas.csv"
+COSTS_CSV_PATH = PROJECT_ROOT / "data/costos_cajas.csv"
 COST_PER_LANE_ANNUAL = _load_annual_costs_from_csv(COSTS_CSV_PATH)
 
 
@@ -168,11 +168,15 @@ def _evaluate_policy_once(
     run_id: str = "run",
     keep_outputs: bool = False,
     context: str | None = None,
+    *,
+    use_in_memory: bool = False,
+    shared_output_root: Path | None = None,
 ) -> tuple[float, float]:
     counts_norm = _apply_lane_config(x)
 
-    output_root = PROJECT_ROOT / "outputs_opt" / f"{run_id}"
-    if output_root.exists():
+    base_root = shared_output_root or (PROJECT_ROOT / "outputs_opt")
+    output_root = base_root / f"{run_id}"
+    if not use_in_memory and shared_output_root is None and output_root.exists():
         shutil.rmtree(output_root, ignore_errors=True)
 
     if context:
@@ -182,23 +186,31 @@ def _evaluate_policy_once(
             f"[SIM] Dia={day_type.name} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
         )
 
-    sim.simulacion_periodos(
+    stats_muestra = sim.simulacion_periodos(
         num_weeks=num_weeks_sample,
         output_root=str(output_root),
         include_timestamp=False,
         start_week_idx=1,
         titulo=f"OPT-EVAL {run_id} x={x}",
+        write_outputs=not use_in_memory,
     )
 
-    df_eval = load_customers_year(output_root)
-    df_eval["total_profit_clp"] = pd.to_numeric(
-        df_eval["total_profit_clp"], errors="coerce"
-    ).fillna(0)
+    if use_in_memory:
+        prof_muestra = sum(
+            float(r.get("profit_served_clp", 0.0))
+            for r in stats_muestra
+            if str(r.get("dia_tipo", "")).lower() == day_type.value
+        )
+    else:
+        df_eval = load_customers_year(output_root)
+        df_eval["total_profit_clp"] = pd.to_numeric(
+            df_eval["total_profit_clp"], errors="coerce"
+        ).fillna(0)
 
-    df_dt = df_eval[df_eval["dia_tipo"].str.lower() == day_type.value]
-    prof_muestra = df_dt.loc[
-        df_dt["outcome_norm"] == "served", "total_profit_clp"
-    ].sum()
+        df_dt = df_eval[df_eval["dia_tipo"].str.lower() == day_type.value]
+        prof_muestra = df_dt.loc[
+            df_dt["outcome_norm"] == "served", "total_profit_clp"
+        ].sum()
 
     factor_anual = 52.0 / float(num_weeks_sample)
     profit_anual = float(prof_muestra * factor_anual)
@@ -206,7 +218,7 @@ def _evaluate_policy_once(
     cost_anual = cost_anual_config(counts_norm)
     objetivo = profit_anual - cost_anual
 
-    if not keep_outputs:
+    if not use_in_memory and not keep_outputs and shared_output_root is None:
         shutil.rmtree(output_root, ignore_errors=True)
 
     if context:
@@ -228,7 +240,9 @@ class EvalSAAResult:
     day_type: sim.DayType
 
 
-_FITNESS_CACHE: dict[tuple[tuple[int, int, int, int], sim.DayType, float], EvalSAAResult] = {}
+# Cache de fitness: la clave incluye configuraci�n, tipo de d�a, factor de demanda,
+# semanas/r�plicas usadas y el modo de evaluaci�n (memoria/disco) o escenarios.
+_FITNESS_CACHE: dict[tuple, EvalSAAResult] = {}
 
 
 ScenarioWeight = tuple[str, float, float]
@@ -242,8 +256,24 @@ def evaluate_policy_saa(
     keep_outputs: bool = False,
     eval_context: str | None = None,
     scenarios: Sequence[ScenarioWeight] | None = None,
+    use_in_memory: bool | None = None,
+    shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
+    # Por defecto usamos el modo en memoria para evitar escrituras/lecturas
+    # costosas; si se piden outputs persistidos, lo desactivamos.
+    if use_in_memory is None:
+        use_in_memory = not keep_outputs
+    elif keep_outputs and use_in_memory:
+        use_in_memory = False
+
     if scenarios:
+        scenario_sig = tuple(
+            (str(lbl), float(fac), float(1.0 if w is None else w))
+            for lbl, fac, w in scenarios
+        )
+        cache_key = (tuple(int(v) for v in x), day_type, scenario_sig, num_weeks_sample, num_rep, use_in_memory)
+        if cache_key in _FITNESS_CACHE:
+            return _FITNESS_CACHE[cache_key]
         return _evaluate_policy_multi_scenarios(
             x,
             day_type=day_type,
@@ -252,6 +282,9 @@ def evaluate_policy_saa(
             keep_outputs=keep_outputs,
             eval_context=eval_context,
             scenarios=scenarios,
+            use_in_memory=use_in_memory,
+            cache_key=cache_key,
+            shared_output_root=shared_output_root,
         )
     return _evaluate_policy_saa_single(
         x,
@@ -260,6 +293,8 @@ def evaluate_policy_saa(
         num_rep=num_rep,
         keep_outputs=keep_outputs,
         eval_context=eval_context,
+        use_in_memory=use_in_memory,
+        shared_output_root=shared_output_root,
     )
 
 
@@ -270,11 +305,13 @@ def _evaluate_policy_saa_single(
     num_rep: int = 3,
     keep_outputs: bool = False,
     eval_context: str | None = None,
+    use_in_memory: bool = False,
+    shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
     x = tuple(int(v) for v in x)
     current_factor = float(sim.get_demand_multiplier())
     factor_key = round(current_factor, 9)
-    key = (x, day_type, factor_key)
+    key = (x, day_type, factor_key, num_weeks_sample, num_rep, use_in_memory)
 
     if key in _FITNESS_CACHE:
         return _FITNESS_CACHE[key]
@@ -301,6 +338,8 @@ def _evaluate_policy_saa_single(
             run_id=run_id,
             keep_outputs=keep_outputs,
             context=f"{run_context} | rep={rep + 1}/{num_rep}",
+            use_in_memory=use_in_memory,
+            shared_output_root=shared_output_root,
         )
         global EVAL_COUNT
         EVAL_COUNT += 1
@@ -347,6 +386,9 @@ def _evaluate_policy_multi_scenarios(
     keep_outputs: bool,
     eval_context: str | None,
     scenarios: Sequence[ScenarioWeight],
+    use_in_memory: bool,
+    cache_key,
+    shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
     prev_factor = float(sim.get_demand_multiplier())
     agg_profit = 0.0
@@ -372,6 +414,7 @@ def _evaluate_policy_multi_scenarios(
                 eval_context=(
                     f"{eval_context} | escenario={label}" if eval_context else None
                 ),
+                use_in_memory=use_in_memory,
             )
             last_res = res
             agg_profit += weight_val * res.profit_mean
@@ -390,17 +433,23 @@ def _evaluate_policy_multi_scenarios(
             num_rep=num_rep,
             keep_outputs=keep_outputs,
             eval_context=eval_context,
+            use_in_memory=use_in_memory,
+            shared_output_root=shared_output_root,
         )
 
-    return EvalSAAResult(
+    # Normalizamos por el peso total para no inflar objetivos/profits.
+    inv_w = 1.0 / total_weight
+    res = EvalSAAResult(
         x=x,
-        objetivo_mean=float(agg_obj),
-        objetivo_std=float(agg_obj_std),
-        profit_mean=float(agg_profit),
-        profit_std=float(agg_profit_std),
+        objetivo_mean=float(agg_obj * inv_w),
+        objetivo_std=float(agg_obj_std * inv_w),
+        profit_mean=float(agg_profit * inv_w),
+        profit_std=float(agg_profit_std * inv_w),
         n_rep=last_res.n_rep,
         day_type=day_type,
     )
+    _FITNESS_CACHE[cache_key] = res
+    return res
 
 
 def generar_vecinos(
@@ -445,6 +494,9 @@ def construir_solucion_inicial_grasp(
     max_total_lanes: int | None = None,
     context_label: str | None = None,
     scenario_weights: Sequence[ScenarioWeight] | None = None,
+    use_in_memory: bool = True,
+    keep_outputs: bool = False,
+    shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
@@ -461,6 +513,9 @@ def construir_solucion_inicial_grasp(
         num_rep=num_rep_saa,
         eval_context=f"{base_context} | fase=GRASP | iter=0 (init)",
         scenarios=scenario_weights,
+        use_in_memory=use_in_memory,
+        keep_outputs=keep_outputs,
+        shared_output_root=shared_output_root,
     )
     _print_iteration_progress("GRASP", 0, best_eval)
 
@@ -494,6 +549,9 @@ def construir_solucion_inicial_grasp(
                     f" | vecino={idx}/{total_vecinos}"
                 ),
                 scenarios=scenario_weights,
+                use_in_memory=use_in_memory,
+                keep_outputs=keep_outputs,
+                shared_output_root=shared_output_root,
             )
             evals.append(ev)
 
@@ -542,6 +600,9 @@ def busqueda_local(
     cooling: float = 0.9,
     context_label: str | None = None,
     scenario_weights: Sequence[ScenarioWeight] | None = None,
+    use_in_memory: bool = True,
+    keep_outputs: bool = False,
+    shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
@@ -555,6 +616,9 @@ def busqueda_local(
         num_rep=num_rep_saa,
         eval_context=f"{base_context} | fase=BUSQ | iter=0",
         scenarios=scenario_weights,
+        use_in_memory=use_in_memory,
+        keep_outputs=keep_outputs,
+        shared_output_root=shared_output_root,
     )
     best = current
     T = float(T0)
@@ -587,6 +651,9 @@ def busqueda_local(
                     f" | vecino={idx}/{total_vecinos}"
                 ),
                 scenarios=scenario_weights,
+                use_in_memory=use_in_memory,
+                keep_outputs=keep_outputs,
+                shared_output_root=shared_output_root,
             )
             vec_evals.append(ev)
 
@@ -777,6 +844,8 @@ def optimizar_cajas_grasp_saa(
     initial_solution: tuple[int, int, int, int] | None = None,
     context_label: str | None = None,
     scenario_weights: Sequence[ScenarioWeight] | None = None,
+    use_in_memory: bool | None = None,
+    keep_outputs_eval: bool = False,
 ) -> EvalSAAResult:
     global START_TIME, MAX_SECONDS, MAX_EVALS, EVAL_COUNT
     START_TIME = time.time()
@@ -788,6 +857,16 @@ def optimizar_cajas_grasp_saa(
     best: EvalSAAResult | None = None
     x0_eval: EvalSAAResult | None = None
     context_base = context_label or f"Dia={day_type.name}"
+
+    if use_in_memory is None:
+        use_in_memory = not keep_outputs_eval
+    shared_tmp = None
+    if not use_in_memory and not keep_outputs_eval:
+        # Reutilizamos un directorio temporal para todas las r�plicas/vecinos
+        from tempfile import TemporaryDirectory
+
+        shared_tmp_ctx = TemporaryDirectory()
+        shared_tmp = Path(shared_tmp_ctx.name)
 
     try:
         print(f"\n=== Optimizacion para dia tipo {day_type.name} ===")
@@ -802,9 +881,11 @@ def optimizar_cajas_grasp_saa(
                 day_type=day_type,
                 num_weeks_sample=num_weeks_sample_busqueda,
                 num_rep=num_rep_saa_busqueda,
-                keep_outputs=False,
+                keep_outputs=keep_outputs_eval,
                 eval_context=f"{context_base} | fase=INIT_HEREDADA",
                 scenarios=scenario_weights,
+                use_in_memory=use_in_memory,
+                shared_output_root=shared_tmp,
             )
             imprimir_resumen_resultado(
                 x0_eval,
@@ -819,6 +900,9 @@ def optimizar_cajas_grasp_saa(
                 max_total_lanes=max_total_lanes,
                 context_label=context_base,
                 scenario_weights=scenario_weights,
+                use_in_memory=use_in_memory,
+                keep_outputs=keep_outputs_eval,
+                shared_output_root=shared_tmp,
             )
             imprimir_resumen_resultado(
                 x0_eval,
@@ -845,6 +929,9 @@ def optimizar_cajas_grasp_saa(
             cooling=0.85,
             context_label=context_base,
             scenario_weights=scenario_weights,
+            use_in_memory=use_in_memory,
+            keep_outputs=keep_outputs_eval,
+            shared_output_root=shared_tmp,
         )
 
         imprimir_resumen_resultado(
@@ -868,6 +955,13 @@ def optimizar_cajas_grasp_saa(
             _export_progress_csv(day_type)
             return x0_eval
         raise
+    finally:
+        # Limpia el directorio temporal compartido si se cre� en modo r�pido con disco.
+        if shared_tmp is not None:
+            try:
+                shared_tmp_ctx.cleanup()
+            except Exception:
+                pass
 
 
 @dataclass

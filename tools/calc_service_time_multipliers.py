@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("service_time/service_time_multipliers.csv"),
+        default=Path("data/service_time/service_time_multipliers.csv"),
         help="CSV de salida con los multiplicadores",
     )
     args = parser.parse_args()

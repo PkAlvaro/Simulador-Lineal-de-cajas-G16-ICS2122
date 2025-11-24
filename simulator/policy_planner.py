@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover
     _evaluate_base_performance = None
 
 try:
-    from optimizador_cajas import evaluate_policy_saa, optimizar_cajas_grasp_saa
+    from .optimizador_cajas import evaluate_policy_saa, optimizar_cajas_grasp_saa
 except ImportError:  # pragma: no cover
     optimizar_cajas_grasp_saa = None
     evaluate_policy_saa = None
@@ -114,7 +114,7 @@ def _optimizer_worker(task):
         optimizer_kwargs,
     ) = task
     from simulator import engine as eng
-    from optimizador_cajas import optimizar_cajas_grasp_saa as opt
+    from simulator.optimizador_cajas import optimizar_cajas_grasp_saa as opt
 
     day_type = DayType(day_value)
     print(
@@ -142,7 +142,7 @@ def _optimizer_worker(task):
 
 def _optimize_daytype_worker(task):
     day_value, optimizer_kwargs, scenario_weights = task
-    from optimizador_cajas import optimizar_cajas_grasp_saa as opt
+    from simulator.optimizador_cajas import optimizar_cajas_grasp_saa as opt
 
     dt = DayType(day_value)
     result = opt(

@@ -19,9 +19,55 @@ DATA_ROOT = PROJECT_ROOT
 OPEN_S = 8 * 3600
 CLOSE_S = 22 * 3600
 BIN_SEC = 1
+CACHE_DIR = PROJECT_ROOT / "data" / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _ANNOUNCED_FILES: set[Path] = set()
 _DEMAND_SCALING_FACTOR: float = 1.0
+# Sigma para la distribución Lognormal de llegadas (ajustado a datos teóricos ~1.0-1.4)
+ARRIVAL_LOGNORMAL_SIGMA: float = 1.3
+
+# === CONTROL DE SEMILLAS ALEATORIAS (Reproducibilidad) ===
+# Semilla maestra para reproducibilidad completa
+# - Para análisis/debugging: usar semilla fija (ej. 42)
+# - Para producción/múltiples réplicas: cambiar cada vez
+_MASTER_SEED: int = 42
+
+def set_global_seed(seed: int) -> None:
+    """
+    Establece la semilla maestra para TODOS los generadores aleatorios del simulador.
+    Garantiza reproducibilidad completa de los resultados.
+    
+    Args:
+        seed: Semilla maestra (entero). Usar el mismo valor reproduce resultados idénticos.
+    
+    Nota: Debe llamarse ANTES de cualquier simulación.
+    """
+    global _MASTER_SEED, RNG_ITEMS, RNG_PROFIT, SERVICE_TIME_MODEL
+    _MASTER_SEED = int(seed)
+    
+    # Reinicializar todos los RNGs con semillas derivadas
+    np.random.seed(_MASTER_SEED)  # Para cualquier np.random legacy
+    
+    # RNG para ítems (usará seed + 1)
+    if 'RNG_ITEMS' in globals():
+        globals()['RNG_ITEMS'] = np.random.default_rng(_MASTER_SEED + 1)
+    
+    # RNG para profit (usará seed + 2)
+    if 'RNG_PROFIT' in globals():
+        globals()['RNG_PROFIT'] = np.random.default_rng(_MASTER_SEED + 2)
+        if '_PROFIT_NOISE_POOL' in globals():
+            globals()['_PROFIT_NOISE_POOL'] = _NormalNoisePool(globals()['RNG_PROFIT'])
+    
+    # SERVICE_TIME_MODEL se reinicializará con seed + 3 al cargarse
+    # (ver ServiceTimeFactorModel.__init__)
+    
+    print(f"[SEED] Semilla maestra establecida: {_MASTER_SEED}")
+    print(f"[SEED] Todas las simulaciones ahora son reproducibles")
+
+def get_global_seed() -> int:
+    """Retorna la semilla maestra actual."""
+    return _MASTER_SEED
 
 
 def _info(message: str, path: Optional[Path] = None) -> None:
@@ -41,6 +87,29 @@ def _announce_once(label: str, path: Path) -> None:
         return
     _ANNOUNCED_FILES.add(path)
     _info(label, path)
+
+
+def _load_pickle_cache(cache_path: Path, source_mtime: float):
+    """
+    Devuelve el contenido del cache si existe y es mas reciente que la fuente.
+    Evita recomputar/parsear CSV voluminosos en cada ejecucion.
+    """
+    try:
+        if cache_path.exists() and cache_path.stat().st_mtime >= source_mtime:
+            with cache_path.open("rb") as fh:
+                return pickle.load(fh)
+    except Exception:
+        return None
+    return None
+
+
+def _save_pickle_cache(cache_path: Path, obj) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with cache_path.open("wb") as fh:
+            pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
 
 
 def set_demand_multiplier(factor: float) -> float:
@@ -133,6 +202,7 @@ def reset_checkout_item_limits() -> tuple[int, int]:
 
 def get_checkout_item_limits() -> tuple[int, int]:
     return _EXPRESS_MAX_ITEMS, _SCO_MAX_ITEMS
+
 LANE_PREFIXES = {
     LaneType.REGULAR: "REG",
     LaneType.EXPRESS: "EXP",
@@ -144,7 +214,7 @@ LANE_NAME_NORMALIZATION = {
     "self_checkout": "self_checkout",
 }
 SERVICE_TIME_MULTIPLIERS_PATH = (
-    PROJECT_ROOT / "service_time/service_time_multipliers.csv"
+    PROJECT_ROOT / "data/service_time/service_time_multipliers.csv"
 )
 _SERVICE_TIME_MULTIPLIERS = {}
 
@@ -195,9 +265,10 @@ _SERVICE_TIME_MULTIPLIERS = _load_service_time_multipliers(
     SERVICE_TIME_MULTIPLIERS_PATH
 )
 PATIENCE_DISTRIBUTION_FILE = (
-    PROJECT_ROOT / "patience/patience_distribution_profile_priority_payment_day.csv"
+    PROJECT_ROOT / "data/patience/patience_distribution_profile_priority_payment_day.csv"
 )
 PATIENCE_BASE_CSV_FILE = PATIENCE_DISTRIBUTION_FILE
+PATIENCE_CACHE_FILE = CACHE_DIR / "patience_table.pkl"
 _PATIENCE_TABLE_ANNOUNCED = False
 _PATIENCE_SAMPLER_INSTANCE = None
 DEFAULT_LANE_COUNTS = {
@@ -286,7 +357,7 @@ CURRENT_LANE_POLICY.update(
     }
 )
 
-LANE_COSTS_FILE = PROJECT_ROOT / "costos_cajas.csv"
+LANE_COSTS_FILE = PROJECT_ROOT / "data/costos_cajas.csv"
 
 
 @dataclass
@@ -423,7 +494,7 @@ LANE_COST_BY_DAYTYPE_STR = {
 
 # Cargando tasas de llegada desde npz generados por tools/rebuild_arrivals.py.
 
-ARRIVALS_NPZ_DIR = PROJECT_ROOT / "arrivals_npz"
+ARRIVALS_NPZ_DIR = PROJECT_ROOT / "data/arrivals_npz"
 _ARRIVAL_FILES = {
     CustomerProfile.DEAL_HUNTER: ARRIVALS_NPZ_DIR / "lambda_deal_hunter.npz",
     CustomerProfile.FAMILY_CART: ARRIVALS_NPZ_DIR / "lambda_family_cart.npz",
@@ -591,8 +662,9 @@ def _normalize_day_type_value(value) -> Optional[DayType]:
 
 # ## Volumen de compra
 
-ITEMS_SUMMARY_FILE = PROJECT_ROOT / "items_distribution_summary.csv"
-RNG_ITEMS = np.random.default_rng(123)
+ITEMS_SUMMARY_FILE = PROJECT_ROOT / "data/items_distribution_summary.csv"
+ITEMS_CACHE_FILE = CACHE_DIR / "items_distributions.pkl"
+RNG_ITEMS = np.random.default_rng(_MASTER_SEED + 1)  # Items distribution
 
 
 @dataclass
@@ -694,6 +766,31 @@ def _build_kde_model(
     return model
 
 
+ARRIVAL_KDE_PARAMS_FILE = PROJECT_ROOT / "data/arrival_kde_params.json"
+ARRIVAL_KDE_MODEL = None
+
+def _load_arrival_kde():
+    global ARRIVAL_KDE_MODEL
+    if not ARRIVAL_KDE_PARAMS_FILE.exists():
+        return
+    try:
+        with open(ARRIVAL_KDE_PARAMS_FILE, "r") as f:
+            params = json.load(f)
+        
+        support = np.array(params.get("support", []))
+        probs = np.array(params.get("probs", []))
+        kernel = params.get("kernel", "gaussian")
+        bandwidth = params.get("bandwidth", 1.0)
+        
+        if len(support) > 0 and len(probs) > 0:
+             ARRIVAL_KDE_MODEL = _build_kde_model(support, probs, kernel, bandwidth)
+             _announce_once("Cargado modelo KDE para llegadas", ARRIVAL_KDE_PARAMS_FILE)
+    except Exception as e:
+        _warn(f"Error cargando KDE de llegadas: {e}")
+
+_load_arrival_kde()
+
+
 def _row_to_item_spec(row: Dict[str, Any]) -> ItemDistributionSpec:
     fit_type = (row.get("fit_type") or "").strip().lower()
     if fit_type == "parametric":
@@ -741,6 +838,11 @@ def load_item_distributions(
     Tuple[CustomerProfile, PriorityType, Optional[PaymentMethod], Optional[DayType]],
     ItemDistributionSpec,
 ]:
+    path = Path(path)
+    cache_hit = _load_pickle_cache(ITEMS_CACHE_FILE, path.stat().st_mtime)
+    if cache_hit is not None:
+        return cache_hit
+
     store: Dict[
         Tuple[
             CustomerProfile, PriorityType, Optional[PaymentMethod], Optional[DayType]
@@ -757,12 +859,13 @@ def load_item_distributions(
                 day_type = _normalize_day_type_value(row.get("day_type"))
                 spec = _row_to_item_spec(row)
                 store[(profile, priority, payment, day_type)] = spec
-            except Exception:
-                continue
+            except Exception as exc:
+                _warn(f"Fila de items ignorada ({exc})", path)
     if not store:
         raise RuntimeError(
             "No se pudieron cargar distribuciones de items desde items_distribution_summary.csv"
         )
+    _save_pickle_cache(ITEMS_CACHE_FILE, store)
     return store
 
 
@@ -1121,7 +1224,7 @@ class PatienceDistributionTable:
     source_file: Path = PATIENCE_DISTRIBUTION_FILE
     fallback: PatienceDistributionCSV | None = None
     rng: np.random.Generator = field(
-        default_factory=lambda: np.random.default_rng(2025)
+        default_factory=lambda: np.random.default_rng(_MASTER_SEED + 4)  # Patience distribution
     )
     _entries: dict = None
     _cache: dict = None
@@ -1179,6 +1282,10 @@ class PatienceDistributionTable:
             raise FileNotFoundError(
                 f"No existe el archivo de distribuciones de paciencia: {path}"
             )
+        cache_hit = _load_pickle_cache(PATIENCE_CACHE_FILE, path.stat().st_mtime)
+        if cache_hit is not None:
+            return cache_hit
+
         df = pd.read_csv(path)
         required_cols = {"profile", "priority", "payment_method", "day_type", "method"}
         if not required_cols.issubset(df.columns):
@@ -1211,6 +1318,7 @@ class PatienceDistributionTable:
                 entry = PatienceDistributionTable._build_kde_entry(kde_grp)
                 if entry:
                     table[(prof, prio, pay, day)] = entry
+        _save_pickle_cache(PATIENCE_CACHE_FILE, table)
         return table
 
     def sample(
@@ -1551,7 +1659,7 @@ class ServiceTimeFactorModel:
         self,
         model_path: Path,
         multipliers: Optional[dict[tuple[str, str], float]] = None,
-        rng_seed: int = 2025,
+        rng_seed: int = None,  # Se usará _MASTER_SEED + 3 si es None
     ):
         with open(model_path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1571,7 +1679,9 @@ class ServiceTimeFactorModel:
             combo = tuple(part.strip().lower() for part in key.split("|"))
             self.residual_models[combo] = self._build_bucket(entry)
         self.defaults = self._build_bucket(data.get("defaults"))
-        self.rng = np.random.default_rng(rng_seed)
+        # Usar semilla derivada de la maestra si no se especifica
+        seed = rng_seed if rng_seed is not None else (_MASTER_SEED + 3)
+        self.rng = np.random.default_rng(seed)
         self.multipliers = multipliers or {}
 
     def _build_distribution(
@@ -1655,9 +1765,41 @@ class ServiceTimeFactorModel:
         prof = _norm_profile(profile)
         return float(self.multipliers.get((lane, prof), 1.0))
 
+    def _stochastic_sco_time(
+        self, items: float, rng: Optional[np.random.Generator] = None
+    ) -> float:
+        """
+        Modelo de Tasa Estocástica para Self-Checkout.
+        Asume que cada cliente tiene una velocidad de escaneo propia.
+        Time = Setup + Items * (1 / Speed)
+        """
+        gen = rng or self.rng
+        
+        # Parámetros estimados para SCO (se podrían externalizar a config)
+        # Setup: tiempo de llegar, tocar pantalla, pagar.
+        setup_time = max(5.0, gen.normal(15.0, 5.0)) 
+        
+        # Tiempo por ítem: Lognormal para capturar la "cola larga" de usuarios lentos
+        # Mu=1.5, Sigma=0.6 -> Media aprox 6-7 seg/item, pero con alta varianza
+        sec_per_item = gen.lognormal(mean=1.5, sigma=0.6)
+        
+        # Límite físico: nadie tarda menos de 0.5s ni más de 60s por ítem promedio
+        sec_per_item = max(0.5, min(sec_per_item, 60.0))
+        
+        return float(setup_time + items * sec_per_item)
+
     def expected_value(
         self, *, profile, priority, payment_method, day_type, lane_type, items: float
     ) -> float:
+        # Para SCO, usamos la media teórica del modelo estocástico
+        if _norm_lane(lane_type) == "self_checkout":
+            # Media lognormal = exp(mu + sigma^2/2)
+            # mu=1.5, sigma=0.6 -> 1.5 + 0.18 = 1.68 -> exp(1.68) ~= 5.36 seg/item
+            avg_setup = 15.0
+            avg_per_item = np.exp(1.5 + (0.6**2)/2)
+            base_val = avg_setup + items * avg_per_item
+            return float(base_val * self._multiplier_for(lane_type, profile))
+
         base = self._base_prediction(
             profile, priority, payment_method, day_type, lane_type, items
         )
@@ -1678,6 +1820,11 @@ class ServiceTimeFactorModel:
         items: float,
         rng: Optional[np.random.Generator] = None,
     ) -> float:
+        # Lógica especial para Self-Checkout (baja correlación, alta varianza por usuario)
+        if _norm_lane(lane_type) == "self_checkout":
+            val = self._stochastic_sco_time(items, rng)
+            return val * self._multiplier_for(lane_type, profile)
+
         generator = rng or self.rng
         base = self._base_prediction(
             profile, priority, payment_method, day_type, lane_type, items
@@ -1689,7 +1836,7 @@ class ServiceTimeFactorModel:
         return value * self._multiplier_for(lane_type, profile)
 
 
-SERVICE_TIME_MODEL_JSON = PROJECT_ROOT / "service_time/service_time_model.json"
+SERVICE_TIME_MODEL_JSON = PROJECT_ROOT / "data/service_time/service_time_model.json"
 SERVICE_TIME_MODEL: Optional[ServiceTimeFactorModel] = None
 if SERVICE_TIME_MODEL_JSON.exists():
     try:
@@ -1755,10 +1902,80 @@ balk_model = QueueCapBalkModel(
 
 BALK_MODEL = balk_model
 
+# Inicializar balking thresholds (se pueden cargar desde CSV si existe)
+BALKING_THRESHOLDS: dict[tuple[str, str, str, str, str], float] = {}
+BALKING_DAYTYPE_FACTORS: dict[str, float] = {
+    "tipo_1": 1.0,
+    "tipo_2": 1.0,
+    "tipo_3": 1.0,
+}
+# Prefiere thresholds filtrados (solo >0) si existen, si no usa el CSV original
+BALKING_THRESHOLDS_FILE = (
+    PROJECT_ROOT / "data/balking_thresholds_positive.csv"
+    if (PROJECT_ROOT / "data/balking_thresholds_positive.csv").exists()
+    else PROJECT_ROOT / "data/balking_thresholds.csv"
+)
 
-# ## RelaciÃ³n de profit
 
-# === Celda: parÃ¡metros de profit con coeficientes por Ã­tems ===
+def _norm_generic(value) -> str:
+    """Normaliza un valor generico a string para usar como clave."""
+    if value is None:
+        return ""
+    if hasattr(value, "value"):
+        value = value.value
+    return str(value).strip().lower()
+
+
+# Carga thresholds de balking desde CSV, aplicando un sesgo +1 a valores > 0
+def _load_balking_thresholds(path: Path) -> dict[tuple[str, str, str, str, str], float]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    _announce_once("Cargando umbrales de balking", path)
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        _warn(f"No se pudo leer {path.name} ({exc})", path)
+        return {}
+    required = {
+        "profile",
+        "priority",
+        "payment_method",
+        "day_type",
+        "lane_type",
+        "estimated_threshold",
+    }
+    if not required.issubset(df.columns):
+        _warn(f"{path.name} no contiene columnas {required}", path)
+        return {}
+
+    table: dict[tuple[str, str, str, str, str], float] = {}
+    for _, row in df.iterrows():
+        try:
+            prof = _norm_generic(row.get("profile"))
+            prio = _norm_generic(row.get("priority"))
+            pay = _norm_generic(row.get("payment_method"))
+            day = _norm_generic(row.get("day_type"))
+            lane = _norm_generic(row.get("lane_type"))
+            raw_thr = row.get("estimated_threshold")
+            if raw_thr in (None, "", np.nan):  # sin dato -> no threshold
+                continue
+            thr = float(raw_thr)
+            if not np.isfinite(thr) or thr <= 0.0:
+                # valores no positivos no aportan tolerancia; se omite para evitar balk inmediato
+                continue
+            # thr += 1.0  # ajuste solicitado: +1 a los thresholds definidos (REMOVIDO)
+            table[(prof, prio, pay, day, lane)] = thr
+        except Exception:
+            continue
+    return table
+
+BALKING_THRESHOLDS = _load_balking_thresholds(BALKING_THRESHOLDS_FILE)
+
+
+# ## Relación de profit
+
+# === Celda: parámetros de profit con coeficientes por ítems ===
 import csv
 import json
 from pathlib import Path
@@ -1766,9 +1983,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-PROFIT_FILE = "profit_analysis_summary.csv"
+PROFIT_FILE = PROJECT_ROOT / "data/profit_analysis_summary.csv"
 
-# Coeficientes de pendiente por Ã­tem cuando no viene en el CSV (CLP por Ã­tem)
+# Coeficientes de pendiente por ítem cuando no viene en el CSV (CLP por ítem)
 PROFILE_COEF_ITEMS = {
     "deal_hunter": 196.951060,
     "regular": 248.6974,
@@ -1887,7 +2104,7 @@ def sample_profit(
     profit_dict: dict = PROFIT_BETAS,
 ) -> float:
     """
-    Estima profit como beta(items) mÃ¡s ruido normal segÃºn el RMSE observado.
+    Estima profit como beta(items) más ruido normal según el RMSE observado.
     """
     items_count = max(0, int(items))
     if items_count <= 0:
@@ -1913,10 +2130,10 @@ def sample_profit(
     return int(round(max(0.0, profit)))
 
 
-# === Celda: integraciÃ³n en el evento de checkout ===
+# === Celda: integración en el evento de checkout ===
 # supuestos: objeto customer con atributos .profile y .items
 if "RNG_PROFIT" not in globals():
-    RNG_PROFIT = np.random.default_rng(42)
+    RNG_PROFIT = np.random.default_rng(_MASTER_SEED + 2)  # Profit noise
 
 
 class _NormalNoisePool:
@@ -1941,183 +2158,18 @@ _PROFIT_NOISE_POOL = _NormalNoisePool(RNG_PROFIT)
 def finalize_customer_profit(
     customer, *, profit_dict=PROFIT_BETAS, default_day_type=DayType.TYPE_1
 ):
-    profile = getattr(customer, "profile", "")
-    priority = getattr(customer, "priority", PriorityType.NO_PRIORITY)
-    payment = getattr(customer, "payment_method", PaymentMethod.CARD)
-    day_type = getattr(customer, "day_type", default_day_type)
-    items = getattr(customer, "items", 0)
-    customer.total_profit_clp = sample_profit(
-        items=int(items),
-        profile=profile,
-        priority=priority,
-        payment_method=payment,
-        day_type=day_type,
-        profit_dict=profit_dict,
-    )
+    items = customer.get("items", 0)
+    profile = customer.get("profile")
+    priority = customer.get("priority")
+    payment = customer.get("payment_method")
+    day = customer.get("day_type", default_day_type)
+    
+    profit = sample_profit(items, profile, priority, payment, day, profit_dict)
+    customer["total_profit_clp"] = profit
+    return profit
 
 
-# df_events: columnas mÃ­nimas ['profile','items'] y opcionales ['priority','payment_method','day_type']
-def compute_profit_column(
-    df_events: pd.DataFrame,
-    *,
-    profit_dict: dict = PROFIT_BETAS,
-    default_priority=PriorityType.NO_PRIORITY,
-    default_payment=PaymentMethod.CARD,
-    default_day_type=DayType.TYPE_1,
-) -> pd.Series:
-    def _row_profit(row: pd.Series) -> float:
-        profile = row.get("profile", "")
-        priority = row.get("priority", default_priority)
-        payment = row.get("payment_method", default_payment)
-        day_type = row.get("day_type", default_day_type)
-        items = row.get("items", 0)
-        return sample_profit(
-            items=int(items),
-            profile=profile,
-            priority=priority,
-            payment_method=payment,
-            day_type=day_type,
-            profit_dict=profit_dict,
-        )
-
-    return df_events.apply(_row_profit, axis=1)
-
-
-# ejemplo:
-# df_events["total_profit_clp"] = compute_profit_column(df_events)
-
-
-# # GeneraciÃ³n de clientes y simulaciÃ³n
-
-# ===================== CSV schemas =====================
-CUSTOMERS_FIELDS = [
-    "source_folder",
-    "customer_id",
-    "profile",
-    "priority",
-    "items",
-    "payment_method",
-    "arrival_time_s",
-    "service_start_s",
-    "service_end_s",
-    "wait_time_s",
-    "service_time_s",
-    "total_time_s",
-    "arrival_hour",
-    "total_revenue_clp",
-    "cart_categories",
-    "cart_category_revenue_clp",
-    "cart_items",
-    "total_profit_clp",
-    "cart_category_profit_clp",
-    "lane_name",
-    "lane_type",
-    "queue_request_priority",
-    "patience_s",
-    "outcome",
-    "balk_reason",
-    "abandon_reason",
-    "effective_queue_length",
-]
-TIMELOG_FIELDS = [
-    "source_folder",
-    "timestamp_s",
-    "event_type",
-    "customer_id",
-    "profile",
-    "priority",
-    "items",
-    "payment_method",
-    "lane_name",
-    "lane_type",
-    "effective_queue_length",
-    "queue_request_priority",
-    "patience_s",
-    "service_time_s",
-    "revenue_clp",
-    "profit_clp",
-    "reason",
-]
-
-
-def _fill_missing(rows, fields):
-    for r in rows:
-        for k in fields:
-            r.setdefault(k, "")
-
-
-def _norm_generic(value) -> str:
-    if hasattr(value, "value"):
-        value = value.value
-    if value is None:
-        return ""
-    return str(value).strip().lower()
-
-
-def _load_balking_thresholds(path: Path) -> dict[tuple[str, str, str, str, str], float]:
-    path = Path(path)
-    if not path.exists():
-        _warn(
-            "No se encontro archivo de umbrales de balking; se usara sin limites teoricos",
-            path,
-        )
-        return {}
-    try:
-        df = pd.read_csv(path)
-    except Exception as exc:
-        _warn(f"No se pudieron leer umbrales de balking ({exc})", path)
-        return {}
-    _announce_once("Cargando umbrales de balking", path)
-    thresholds: dict[tuple[str, str, str, str, str], float] = {}
-    for row in df.itertuples(index=False):
-        limit = getattr(row, "estimated_threshold", None)
-        if pd.isna(limit):
-            continue
-        key = (
-            _norm_generic(getattr(row, "profile", "")),
-            _norm_generic(getattr(row, "priority", "")),
-            _norm_generic(getattr(row, "payment_method", "")),
-            _norm_generic(getattr(row, "day_type", "")),
-            _norm_generic(getattr(row, "lane_type", "")),
-        )
-        thresholds[key] = float(limit)
-    return thresholds
-
-
-BALKING_DAYTYPE_FACTORS_FILE = PROJECT_ROOT / "balking/balking_daytype_factors.csv"
-
-
-def _load_balking_daytype_factors(path: Path) -> dict[str, float]:
-    path = Path(path)
-    if not path.exists():
-        return {}
-    try:
-        df = pd.read_csv(path)
-    except Exception as exc:
-        _warn(f"No se pudieron leer factores por tipo de dia ({exc})", path)
-        return {}
-    factors: dict[str, float] = {}
-    for row in df.itertuples(index=False):
-        day = _norm_generic(getattr(row, "day_type", ""))
-        try:
-            factor = float(getattr(row, "multiplier", 1.0))
-        except (TypeError, ValueError):
-            continue
-        if not day:
-            continue
-        factors[day] = max(0.0, factor)
-    if factors:
-        _announce_once("Factores de balking por tipo de dia cargados", path)
-    return factors
-
-
-BALKING_THRESHOLDS = _load_balking_thresholds(
-    PROJECT_ROOT / "balking/balking_thresholds.csv"
-)
-BALKING_DAYTYPE_FACTORS = _load_balking_daytype_factors(BALKING_DAYTYPE_FACTORS_FILE)
-
-
-def lookup_balking_threshold(
+def get_balking_threshold(
     profile,
     priority,
     payment_method,
@@ -2161,9 +2213,9 @@ def spawn_customer(
 ):
     """
     arrival_time_s relativo a 08:00 (desde la apertura).
-    balk_model: instancia con mÃ©todos prob_balk/decide (p. ej., QueueCapBalkModel) o None.
+    balk_model: instancia con métodos prob_balk/decide (p. ej., QueueCapBalkModel) o None.
     profit_dict: tabla de betas cargada con _load_profit_betas().
-    day_type: enum DayType del dÃ­a en curso.
+    day_type: enum DayType del día en curso.
     """
     yield env.timeout(cliente["arrival_time_s"])
 
@@ -2227,140 +2279,61 @@ def spawn_customer(
                 "wait_time_s": "",
                 "service_time_s": "",
                 "total_time_s": "",
-                "arrival_hour": int((OPEN_S + cliente["arrival_time_s"]) // 3600),
                 "lane_name": "",
                 "lane_type": "",
-                "queue_request_priority": as_str(cliente["priority"]),
+                "effective_queue_length": 0,
                 "outcome": "balk",
                 "balk_reason": reason,
                 "abandon_reason": "",
-                "effective_queue_length": 0,
             }
         )
         customers_rows.append(registro)
         return
 
-    def cola_efectiva(lane: "CheckoutLane"):
-        en_queue = len(lane.servidor.queue)
-        if lane.lane_type is LaneType.SCO:
-            cap = getattr(lane, "capacity", 1)
-            en_servicio = min(getattr(lane.servidor, "count", 0), cap)
-            total = en_queue + en_servicio
-            return max(0, total - cap)
-        en_servicio = 1 if getattr(lane.servidor, "count", 0) > 0 else 0
-        return en_queue + en_servicio
+    # 2) elegir caja (lógica de balanceo de carga)
+    # Estrategia: menor cola efectiva (len(queue) + len(users))
+    # Para empates, random choice.
+    # Ojo con perfiles express que prefieren cajas express si están disponibles
+    
+    # Lógica especial Express Basket:
+    # Si hay cajas express disponibles con poca cola, las prefiere.
+    # Si no, usa regular.
+    
+    candidates = eligibles
+    # Filtro opcional: si es express profile, dar peso a express lanes
+    # (implementación simple: si hay express y regular, elegir express con prob alta)
+    
+    # Calcular largo de cola para todos los candidatos
+    # queue_len = len(lane.servidor.queue) + len(lane.servidor.users)
+    
+    # Mejor estrategia: min(queue_len).
+    
+    def get_len(ln):
+        return len(ln.servidor.queue) + len(ln.servidor.users)
 
-    def estado_lane(lane: "CheckoutLane") -> int:
-        cap = getattr(lane, "capacity", 1)
-        busy = min(getattr(lane.servidor, "count", 0), cap)
-        queue_len = len(lane.servidor.queue)
-        if queue_len == 0 and busy == 0:
-            return 0  # caja totalmente vacÃ­a
-        if queue_len == 0 and 0 < busy < cap:
-            return 1  # hay servicio pero queda un puesto libre
-        return 2  # resto de casos
+    cola_efectiva = get_len
 
-    base_servicio_default = float(max(1.0, 15.0 + 4.0 * int(cliente["items"])))
-    servicio_cache: dict[LaneType, float] = {}
+    min_len = min(get_len(ln) for ln in candidates)
+    best_lanes = [ln for ln in candidates if get_len(ln) == min_len]
+    
+    # Desempate: si hay express y el perfil es express, preferir express
+    if (
+        cliente["profile"] == CustomerProfile.EXPRESS_BASKET
+        and any(ln.lane_type == LaneType.EXPRESS for ln in best_lanes)
+    ):
+        express_best = [ln for ln in best_lanes if ln.lane_type == LaneType.EXPRESS]
+        if express_best:
+            best_lanes = express_best
 
-    def _servicio_estimado_lane(lane_type: LaneType) -> float:
-        cached = servicio_cache.get(lane_type)
-        if cached is not None:
-            return cached
-        servicio_prom = base_servicio_default
-        if "SERVICE_TIME_MODEL" in globals():
-            try:
-                servicio_prom = SERVICE_TIME_MODEL.expected_value(
-                    profile=cliente["profile"],
-                    items=int(cliente["items"]),
-                    lane_type=lane_type,
-                    priority=cliente["priority"],
-                    payment_method=cliente["payment_method"],
-                    day_type=cliente.get("day_type"),
-                )
-                if not (np.isfinite(servicio_prom) and servicio_prom > 0):
-                    servicio_prom = base_servicio_default
-            except Exception:
-                servicio_prom = base_servicio_default
-        servicio_prom = float(max(1.0, servicio_prom))
-        servicio_cache[lane_type] = servicio_prom
-        return servicio_prom
+    lane = best_lanes[int(np.random.randint(len(best_lanes)))]
 
-    def tiempo_estimado_espera(lane: "CheckoutLane") -> float:
-        cap = max(1, getattr(lane, "capacity", 1))
-        ahead = max(0.0, float(lane._eff))
-        servicio_prom = _servicio_estimado_lane(lane.lane_type)
-        return (ahead / cap) * servicio_prom
+    eff_q_len = get_len(lane)
 
-    # 2) elegir caja priorizando vacÃ­as, luego con hueco, luego cola efectiva
-    for lane in eligibles:
-        lane._state = estado_lane(lane)
-        lane._eff = cola_efectiva(lane)
-    best_state = min(lane._state for lane in eligibles)
-    candidatos = [lane for lane in eligibles if lane._state == best_state]
-
-    def _pick_random(lanes: list[CheckoutLane]) -> CheckoutLane:
-        if len(lanes) == 1:
-            return lanes[0]
-        slow_profile = cliente["profile"] in SLOW_PROFILES
-        express = [ln for ln in lanes if ln.lane_type is LaneType.EXPRESS]
-        others = [ln for ln in lanes if ln.lane_type is not LaneType.EXPRESS]
-        if slow_profile:
-            preferred = [
-                ln
-                for ln in others
-                if ln.lane_type in (LaneType.REGULAR, LaneType.PRIORITY)
-            ]
-            if preferred:
-                return preferred[np.random.randint(len(preferred))]
-        if express:
-            weight = EXPRESS_PROFILE_WEIGHT.get(
-                cliente["profile"], DEFAULT_EXPRESS_WEIGHT
-            )
-            if slow_profile:
-                weight = min(weight, 0.05)
-            if np.random.random() < weight:
-                return express[np.random.randint(len(express))]
-            if others:
-                return others[np.random.randint(len(others))]
-        return lanes[np.random.randint(len(lanes))]
-
-    if best_state >= 2:
-        for lane in candidatos:
-            lane._wait_est = tiempo_estimado_espera(lane)
-        min_wait = min(lane._wait_est for lane in candidatos)
-        WAIT_TOL = 2.0  # segundos
-        mejores = [lane for lane in candidatos if lane._wait_est <= min_wait + WAIT_TOL]
-        lane = _pick_random(mejores)
-    else:
-        lane = min(candidatos, key=lambda ln: ln._eff)
-    eff_q_len = max(int(lane._eff), 0)
-    lane_type_txt = lane_type_str(lane)
-
-    # 3) loguear solicitud de cola
-    time_log.append(
-        {
-            "source_folder": cliente["source_folder"],
-            "timestamp_s": env.now,
-            "event_type": "queue_request",
-            "customer_id": cliente["customer_id"],
-            "profile": as_str(cliente["profile"]),
-            "priority": as_str(cliente["priority"]),
-            "items": cliente["items"],
-            "payment_method": as_str(cliente["payment_method"]),
-            "lane_name": lane.lane_id,
-            "lane_type": lane_type_txt,
-            "effective_queue_length": eff_q_len,
-            "queue_request_priority": as_str(cliente["priority"]),
-            "patience_s": cliente["patience_s"],
-            "service_time_s": 0,
-            "revenue_clp": 0,
-            "profit_clp": 0,
-            "reason": "",
-        }
-    )
-
-    def _registrar_balk(reason: str) -> None:
+    # 3) balk determinístico (threshold)
+    # Se carga desde CSV balking_thresholds_positive.csv
+    # Si eff_q_len > threshold -> balk
+    
+    def _registrar_balk(reason):
         time_log.append(
             {
                 "source_folder": cliente["source_folder"],
@@ -2372,7 +2345,7 @@ def spawn_customer(
                 "items": cliente["items"],
                 "payment_method": as_str(cliente["payment_method"]),
                 "lane_name": lane.lane_id,
-                "lane_type": lane_type_txt,
+                "lane_type": lane_type_str(lane),
                 "effective_queue_length": eff_q_len,
                 "queue_request_priority": as_str(cliente["priority"]),
                 "patience_s": cliente["patience_s"],
@@ -2390,9 +2363,8 @@ def spawn_customer(
                 "wait_time_s": "",
                 "service_time_s": "",
                 "total_time_s": "",
-                "arrival_hour": int((OPEN_S + cliente["arrival_time_s"]) // 3600),
                 "lane_name": lane.lane_id,
-                "lane_type": lane_type_txt,
+                "lane_type": lane_type_str(lane),
                 "queue_request_priority": as_str(cliente["priority"]),
                 "outcome": "balk",
                 "balk_reason": reason,
@@ -2403,7 +2375,7 @@ def spawn_customer(
         customers_rows.append(registro)
 
     day_type_value = cliente.get("day_type") or day_type
-    threshold = lookup_balking_threshold(
+    threshold = get_balking_threshold(
         cliente["profile"],
         cliente["priority"],
         cliente["payment_method"],
@@ -2413,25 +2385,6 @@ def spawn_customer(
     if threshold is not None and eff_q_len > threshold:
         _registrar_balk("queue_threshold")
         return
-
-    # 4) balk probabilÃ­stico
-    if balk_model is not None:
-        p_balk = float(
-            balk_model.prob_balk(
-                profile=cliente["profile"],
-                priority=cliente["priority"],
-                queue_len=eff_q_len,
-                items=int(cliente["items"]),
-                lane_type=lane.lane_type,
-                payment=cliente["payment_method"],
-                arrival_hour=int((OPEN_S + cliente["arrival_time_s"]) // 3600),
-                day_type=day_type_value,
-            )
-        )
-        p_balk = min(max(p_balk, 0.0), 1.0)
-        if np.random.random() < p_balk:
-            _registrar_balk("balk_model")
-            return
 
     # 5) esperar turno (paciencia + cierre)
     request_kwargs = {}
@@ -2460,7 +2413,7 @@ def spawn_customer(
                     "items": cliente["items"],
                     "payment_method": as_str(cliente["payment_method"]),
                     "lane_name": lane.lane_id,
-                    "lane_type": lane_type_txt,
+                    "lane_type": lane_type_str(lane),
                     "effective_queue_length": cola_efectiva(lane),
                     "queue_request_priority": as_str(cliente["priority"]),
                     "patience_s": cliente["patience_s"],
@@ -2480,7 +2433,7 @@ def spawn_customer(
                     "total_time_s": env.now - cliente["arrival_time_s"],
                     "arrival_hour": int((OPEN_S + cliente["arrival_time_s"]) // 3600),
                     "lane_name": lane.lane_id,
-                    "lane_type": lane_type_txt,
+                    "lane_type": lane_type_str(lane),
                     "queue_request_priority": as_str(cliente["priority"]),
                     "outcome": "abandon",
                     "balk_reason": "",
@@ -2548,7 +2501,7 @@ def spawn_customer(
                 "items": cliente["items"],
                 "payment_method": as_str(cliente["payment_method"]),
                 "lane_name": lane.lane_id,
-                "lane_type": lane_type_txt,
+                "lane_type": lane_type_str(lane),
                 "effective_queue_length": cola_efectiva(lane),
                 "queue_request_priority": as_str(cliente["priority"]),
                 "patience_s": cliente["patience_s"],
@@ -2569,7 +2522,7 @@ def spawn_customer(
                 "items": cliente["items"],
                 "payment_method": as_str(cliente["payment_method"]),
                 "lane_name": lane.lane_id,
-                "lane_type": lane_type_txt,
+                "lane_type": lane_type_str(lane),
                 "effective_queue_length": max(cola_efectiva(lane), 0),
                 "queue_request_priority": as_str(cliente["priority"]),
                 "patience_s": cliente["patience_s"],
@@ -2591,7 +2544,7 @@ def spawn_customer(
                 "total_time_s": service_end - cliente["arrival_time_s"],
                 "arrival_hour": int((OPEN_S + cliente["arrival_time_s"]) // 3600),
                 "lane_name": lane.lane_id,
-                "lane_type": lane_type_txt,
+                "lane_type": lane_type_str(lane),
                 "queue_request_priority": as_str(cliente["priority"]),
                 "outcome": outcome,
                 "balk_reason": "",
@@ -2604,6 +2557,66 @@ def spawn_customer(
 
 
 from pathlib import Path
+
+
+# CSV field definitions for output files
+CUSTOMERS_FIELDS = [
+    "source_folder",
+    "customer_id",
+    "profile",
+    "priority",
+    "items",
+    "payment_method",
+    "arrival_time_s",
+    "service_start_s",
+    "service_end_s",
+    "wait_time_s",
+    "service_time_s",
+    "total_time_s",
+    "arrival_hour",
+    "total_revenue_clp",
+    "cart_categories",
+    "cart_category_revenue_clp",
+    "cart_items",
+    "total_profit_clp",
+    "cart_category_profit_clp",
+    "lane_name",
+    "lane_type",
+    "queue_request_priority",
+    "patience_s",
+    "outcome",
+    "balk_reason",
+    "abandon_reason",
+    "effective_queue_length",
+]
+
+TIMELOG_FIELDS = [
+    "source_folder",
+    "timestamp_s",
+    "event_type",
+    "customer_id",
+    "profile",
+    "priority",
+    "items",
+    "payment_method",
+    "lane_name",
+    "lane_type",
+    "effective_queue_length",
+    "queue_request_priority",
+    "patience_s",
+    "service_time_s",
+    "revenue_clp",
+    "profit_clp",
+    "reason",
+]
+
+
+def _fill_missing(rows: list[dict], fields: list[str]) -> None:
+    """Fill missing fields in rows with empty strings."""
+    for row in rows:
+        for field in fields:
+            if field not in row:
+                row[field] = ""
 
 
 LAMBDA_MATRIX_DTYPE = np.float32
@@ -2696,6 +2709,8 @@ def _simular_dia_periodo(
     cfg_by_prof: dict[CustomerProfile, ProfileConfig],
     balk_model,
     output_folder: Path,
+    *,
+    write_outputs: bool = True,
 ) -> dict:
     dia_num, day_type, descripcion = dia_config
     tag = f"Week-{week_idx:02d}-Day-{dia_num:02d}"
@@ -2708,12 +2723,12 @@ def _simular_dia_periodo(
         if cantidad <= 0:
             return
         if lane_type is LaneType.SCO:
-            idx = 0
-            for _ in range(cantidad):
-                idx += 1
-                lanes.append(
-                    CheckoutLane(env, f"{prefix}-{idx}", lane_type, capacity=1)
-                )
+            # POOLING EFFECT: Una sola cola compartida para todos los servidores SCO
+            # Esto modela el comportamiento real de self-checkout (M/M/c)
+            # en lugar de múltiples colas independientes (M/M/1 × c)
+            lanes.append(
+                CheckoutLane(env, f"{prefix}-POOL", lane_type, capacity=cantidad)
+            )
             return
         for idx in range(cantidad):
             lanes.append(CheckoutLane(env, f"{prefix}-{idx+1}", lane_type))
@@ -2760,6 +2775,10 @@ def _simular_dia_periodo(
     t0, t1 = OPEN_S, CLOSE_S
     t = float(t0)
     clientes_generados = 0
+    
+    # RNG para generación de llegadas (usa semilla derivada consistentemente por día)
+    # Esto asegura reproducibilidad completa
+    arrival_rng = np.random.default_rng(_MASTER_SEED + 100 + week_idx * 7 + dia_num)
 
     # Precompute matriz de tasas por segundo para acelerar el bucle
     JORNADA = int(CLOSE_S - OPEN_S)
@@ -2770,42 +2789,126 @@ def _simular_dia_periodo(
     else:
         active_seconds = np.empty(0, dtype=int)
 
-    while t < t1:
-        if t > t1:
+    # === TIME RESCALING IMPLEMENTATION ===
+    # Pre-calcular suma acumulada de lambdas (CDF de demanda)
+    lambda_total_per_sec = lam_mat.sum(axis=0)
+    lambda_cumsum = np.cumsum(lambda_total_per_sec)
+    total_demand_integral = lambda_cumsum[-1] if lambda_cumsum.size > 0 else 0.0
+
+    # Inicializar acumulado actual basado en t inicial
+    start_rel_sec = int(max(0, min(JORNADA - 1, t - OPEN_S)))
+    current_cum_lambda = 0.0
+    if start_rel_sec > 0:
+        current_cum_lambda = lambda_cumsum[start_rel_sec - 1]
+    
+    # Ajuste fino si t no es entero (interpolación)
+    if start_rel_sec < lambda_total_per_sec.size:
+        frac_sec = (t - OPEN_S) - start_rel_sec
+        if frac_sec > 0:
+            current_cum_lambda += frac_sec * lambda_total_per_sec[start_rel_sec]
+
+    # Cargar modelo KDE si existe
+    kde_model = None
+    if "ARRIVAL_KDE_MODEL" in globals() and ARRIVAL_KDE_MODEL is not None:
+        kde_model = ARRIVAL_KDE_MODEL
+
+    # Pre-generar deltas para evitar overhead de llamadas a sample() en el loop
+    # Estimamos un maximo generoso de clientes por dia (ej. 50000)
+    # Si se acaba el buffer, se genera mas bajo demanda
+    _KDE_BUFFER_SIZE = 50000
+    _kde_buffer = None
+    _kde_idx = 0
+    
+    if kde_model is not None:
+        try:
+            # Generar en lote es mucho mas rapido
+            _kde_buffer = kde_model.sample(_KDE_BUFFER_SIZE, random_state=arrival_rng.integers(0, 2**32 - 1))
+            if _kde_buffer.ndim > 1:
+                _kde_buffer = _kde_buffer.flatten()
+            _kde_buffer = np.maximum(1e-6, _kde_buffer)
+        except Exception as e:
+            print(f"[WARN] Fallo pre-generacion KDE: {e}")
+            _kde_buffer = None
+
+    while True:
+        # Generar intervalo en "tiempo operacional" (unidades de demanda esperada)
+        delta_tau = 0.0
+        
+        if _kde_buffer is not None:
+            if _kde_idx < len(_kde_buffer):
+                delta_tau = float(_kde_buffer[_kde_idx])
+                _kde_idx += 1
+            else:
+                # Se acabo el buffer, generar uno nuevo (fallback o recarga pequeÃ±a)
+                try:
+                    sample = kde_model.sample(1000, random_state=arrival_rng.integers(0, 2**32 - 1))
+                    if sample.ndim > 1:
+                        sample = sample.flatten()
+                    _kde_buffer = np.maximum(1e-6, sample)
+                    _kde_idx = 1
+                    delta_tau = float(_kde_buffer[0])
+                except Exception:
+                     # Fallback a Lognormal
+                    _sigma = ARRIVAL_LOGNORMAL_SIGMA
+                    _mu = -(_sigma**2) / 2.0
+                    delta_tau = arrival_rng.lognormal(_mu, _sigma)
+        else:
+            # E[X] = 1.0 -> Lognormal(mu, sigma) con mu = -sigma^2/2
+            _sigma = ARRIVAL_LOGNORMAL_SIGMA
+            _mu = -(_sigma**2) / 2.0
+            delta_tau = arrival_rng.lognormal(_mu, _sigma)
+
+        target_cum = current_cum_lambda + delta_tau
+
+        if target_cum > total_demand_integral:
+            break # Se acabó la demanda del día
+
+        # Buscar el segundo donde se alcanza target_cum
+        # searchsorted devuelve idx tal que lambda_cumsum[idx-1] < target_cum <= lambda_cumsum[idx]
+        idx = np.searchsorted(lambda_cumsum, target_cum)
+        
+        if idx >= lambda_cumsum.size:
             break
 
+        # Calcular tiempo exacto interpolando dentro del segundo idx
+        val_start = lambda_cumsum[idx-1] if idx > 0 else 0.0
+        val_end = lambda_cumsum[idx]
+        lambda_at_sec = val_end - val_start
+        
+        if lambda_at_sec <= 1e-9:
+            t_next_rel = float(idx + 1)
+        else:
+            fraction = (target_cum - val_start) / lambda_at_sec
+            t_next_rel = float(idx) + fraction
+
+        t = OPEN_S + t_next_rel
+        
+        if t >= t1:
+            break
+
+        current_cum_lambda = target_cum
+        
+        # Preparar variables para la selección de perfil
+        lambdas = lam_mat[:, idx]
+        Lambda = lambdas.sum() 
+        if Lambda <= 1e-9:
+            continue 
+
         t_rel = t - OPEN_S
-        sec_idx = int(max(0, min(JORNADA, int(t_rel))))
-        # Tasas por segundo para cada combinaciÃ³n en este segundo
-        lambdas = lam_mat[:, sec_idx]
-        Lambda = float(lambdas.sum())
 
-        resto = t % BIN_SEC
-        dt_cap = min((BIN_SEC - resto) if resto != 0 else BIN_SEC, t1 - t)
-
-        if Lambda <= 0.0 or dt_cap <= 0:
-            if Lambda <= 0.0 and active_seconds.size:
-                # Salta directamente al proximo segundo con tasa positiva.
-                next_pos = np.searchsorted(active_seconds, sec_idx + 1)
-                if next_pos < active_seconds.size:
-                    t = OPEN_S + float(active_seconds[next_pos])
-                    continue
-                t = t1
+        # OPTIMIZACION: Selección de perfil manual para evitar overhead de np.choice y normalización
+        # Generamos un número aleatorio entre 0 y Lambda
+        r = arrival_rng.random() * Lambda
+        cum_p = 0.0
+        selected_idx = 0
+        # Recorremos linealmente (rápido para pocos perfiles, < 20)
+        for i in range(len(lambdas)):
+            cum_p += lambdas[i]
+            if r <= cum_p:
+                selected_idx = i
                 break
-            t += max(dt_cap, 1.0)
-            continue
-
-        delta = np.random.exponential(1.0 / Lambda)
-        if delta > dt_cap:
-            t += dt_cap
-            continue
-
-        t += delta
-        t_rel = t - OPEN_S
-
-        probs = lambdas / lambdas.sum()
-        idx = int(np.random.choice(len(combos), p=probs))
-        prof, priority, payment_method, _ = combos[idx]
+        
+        prof, priority, payment_method, _ = combos[selected_idx]
 
         sampler = getattr(cfg_by_prof[prof], "items_sampler", None)
         if callable(sampler):
@@ -2913,21 +3016,22 @@ def _simular_dia_periodo(
     ):
         _fill_missing(rows, fields)
 
-    output_folder.mkdir(parents=True, exist_ok=True)
+    if write_outputs:
+        output_folder.mkdir(parents=True, exist_ok=True)
 
-    with open(output_folder / "customers.csv", "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=CUSTOMERS_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(customers_rows_dia)
+        with open(output_folder / "customers.csv", "w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=CUSTOMERS_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(customers_rows_dia)
 
-    with open(output_folder / "time_log.csv", "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=TIMELOG_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(time_log_dia)
+        with open(output_folder / "time_log.csv", "w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=TIMELOG_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(time_log_dia)
 
-    print(
-        f"[Semana {week_idx}] Dia {dia_num} guardado en {output_folder} ({len(customers_rows_dia)} clientes)"
-    )
+        print(
+            f"[Semana {week_idx}] Dia {dia_num} guardado en {output_folder} ({len(customers_rows_dia)} clientes)"
+        )
 
     items_prom = (
         np.mean([c["items"] for c in customers_rows_dia]) if customers_rows_dia else 0
@@ -2945,6 +3049,18 @@ def _simular_dia_periodo(
         "total_clientes": len(customers_rows_dia),
         "items_promedio": float(items_prom),
         "paciencia_promedio": float(paciencia_prom),
+        "served_clientes": int(
+            sum(1 for c in customers_rows_dia if str(c.get("outcome", "")).lower() == "served")
+        ),
+        "profit_served_clp": float(
+            sum(float(c.get("total_profit_clp", 0) or 0) for c in customers_rows_dia if str(c.get("outcome", "")).lower() == "served")
+        ),
+        "profit_total_clp": float(
+            sum(float(c.get("total_profit_clp", 0) or 0) for c in customers_rows_dia)
+        ),
+        "balked_clientes": int(
+            sum(1 for c in customers_rows_dia if str(c.get("outcome", "")).lower() == "balk")
+        ),
     }
 
 
@@ -2954,6 +3070,8 @@ def simulacion_periodos(
     include_timestamp: bool = False,
     start_week_idx: int = 1,
     titulo: str | None = None,
+    *,
+    write_outputs: bool = True,
 ) -> list[dict]:
     header = titulo or "SIMULACION MULTI-SEMANA"
     print(header + "\n" + "=" * 70)
@@ -2985,7 +3103,8 @@ def simulacion_periodos(
         base_dir = Path(os.getcwd()) / base_dir
     if include_timestamp:
         base_dir = base_dir / datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    base_dir.mkdir(parents=True, exist_ok=True)
+    if write_outputs:
+        base_dir.mkdir(parents=True, exist_ok=True)
 
     stats_por_dia: list[dict] = []
 
@@ -3000,6 +3119,7 @@ def simulacion_periodos(
                 cfg_by_prof=cfg_by_prof,
                 balk_model=BALK_MODEL,
                 output_folder=day_folder,
+                write_outputs=write_outputs,
             )
             stats_por_dia.append(stats)
 

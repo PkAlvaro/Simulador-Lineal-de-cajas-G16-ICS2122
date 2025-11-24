@@ -24,20 +24,6 @@
       "payment_method": {
         "baseline": "card",
         "coeffs": {
-          "cash": 12.213897926853264
-        }
-      },
-      "lane_type": {
-        "baseline": "express",
-        "coeffs": {
-          "priority": 14.3414037714471,
-          "regular": 10.486338805223772,
-          "self_checkout": 33.203424002772934
-        }
-      },
-      "day_type": {
-        "baseline": "tipo_1",
-        "coeffs": {
           "tipo_2": -0.15819678700849002,
           "tipo_3": -0.1438747277560013
         }

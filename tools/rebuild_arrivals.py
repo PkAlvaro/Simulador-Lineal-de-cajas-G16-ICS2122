@@ -276,7 +276,7 @@ def persist_npz(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Recalibra lambdas para el PPNH a partir de outputs teóricos.")
     parser.add_argument("--root", type=Path, default=Path("outputs_teoricos"), help="Carpeta raíz con Week-*-Day-*")
-    parser.add_argument("--output-dir", type=Path, default=Path("arrivals_npz"), help="Destino de los .npz")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/arrivals_npz"), help="Destino de los .npz")
     parser.add_argument("--bin-size", type=int, default=60, help="Tamaño del bin (segundos) para estimar lambda")
     parser.add_argument(
         "--item-bins",

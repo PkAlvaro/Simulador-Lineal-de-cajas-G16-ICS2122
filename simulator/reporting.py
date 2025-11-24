@@ -656,6 +656,9 @@ def run_full_workflow(
 
     status_df = df[df["outcome_norm"].isin(status_cols)].copy()
     counts = status_df.groupby(["profile", "outcome_norm"]).size().unstack(fill_value=0)
+    for col in status_cols:
+        if col not in counts.columns:
+            counts[col] = 0
     counts["total"] = counts.sum(axis=1)
     base_tac = counts.assign(
         served_pct=(counts.get("served", 0) / counts["total"] * 100).round(2),
@@ -767,13 +770,21 @@ def run_full_workflow(
         )
         profit_teo_total = df_teo.loc[df_teo["outcome_norm"] == "served", "total_profit_clp"].sum()
         profit_compare_df.loc[0, "case_base"] = profit_teo_total
+        
+        # Calcular profit teórico degradado (profit_teo - costos)
+        profit_teo_degradado = profit_teo_total - lane_cost_annual
+        
         if profit_teo_total:
             profit_compare_df.loc[0, "error_crudo_pct"] = (
                 (prof_clp_estimado_anual - profit_teo_total) / profit_teo_total * 100.0
             )
-            profit_compare_df.loc[0, "error_degradado_pct"] = (
-                (profit_degradado_anual - profit_teo_total) / profit_teo_total * 100.0
-            )
+            # Error degradado debe compararse contra profit_teo_degradado, NO contra profit_teo_total
+            if profit_teo_degradado != 0:
+                profit_compare_df.loc[0, "error_degradado_pct"] = (
+                    (profit_degradado_anual - profit_teo_degradado) / profit_teo_degradado * 100.0
+                )
+            else:
+                profit_compare_df.loc[0, "error_degradado_pct"] = np.nan
         profit_day_teo = (
             df_teo.loc[df_teo["outcome_norm"] == "served"]
               .groupby("dia_tipo_norm")["total_profit_clp"]
@@ -794,9 +805,13 @@ def run_full_workflow(
                 on="dia_tipo",
                 how="left",
             )
+            # Calcular profit degradado teórico (profit_teo - costos)
+            profit_day_cmp["profit_clp_degradado_teo"] = profit_day_cmp["profit_clp_teo"] - profit_day_cmp["costo_cajas_clp"]
+            
+            # Error porcentual del profit degradado (comparado contra degradado_teo, NO contra crudo_teo)
             profit_day_cmp["profit_clp_degradado_rel_err_pct"] = np.where(
-                profit_day_cmp["profit_clp_teo"] != 0,
-                (profit_day_cmp["profit_clp_degradado"] - profit_day_cmp["profit_clp_teo"]) / profit_day_cmp["profit_clp_teo"] * 100.0,
+                profit_day_cmp["profit_clp_degradado_teo"] != 0,
+                (profit_day_cmp["profit_clp_degradado"] - profit_day_cmp["profit_clp_degradado_teo"]) / profit_day_cmp["profit_clp_degradado_teo"] * 100.0,
                 np.nan,
             )
             profit_day_display = profit_day_cmp[
@@ -804,6 +819,7 @@ def run_full_workflow(
                     "dia_tipo",
                     "profit_clp_teo",
                     "profit_clp_est",
+                    "profit_clp_degradado_teo",
                     "profit_clp_degradado",
                     "costo_cajas_clp",
                     "profit_clp_rel_err_pct",
