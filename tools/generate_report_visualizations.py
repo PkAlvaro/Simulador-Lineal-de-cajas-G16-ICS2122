@@ -32,6 +32,16 @@ CACHE_DIR = PROJECT_ROOT / "data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 VISUALIZATION_DATA_CACHE = CACHE_DIR / "visualization_data.pkl"
 
+# Cargar modelo de tiempos de servicio para visualizacion
+SERVICE_MODEL_PATH = PROJECT_ROOT / "data/service_time/service_time_model.json"
+SERVICE_MODEL_DATA = {}
+if SERVICE_MODEL_PATH.exists():
+    try:
+        with open(SERVICE_MODEL_PATH, encoding="utf-8") as f:
+            SERVICE_MODEL_DATA = json.load(f)
+    except Exception as e:
+        print(f"Error cargando modelo de servicio: {e}")
+
 # Mapeo de días a tipos de día (basado en engine.py)
 DAY_TYPE_MAP = {
     1: "Tipo 1",
@@ -228,7 +238,7 @@ def process_raw_data(root_dir, sample_days=364):
     return collector
 
 def plot_inter_arrival_times(iats, profile, day_type):
-    """Genera histograma de tiempos entre llegadas con comparación estadística de KDE vs Paramétrica."""
+    """Genera histograma de tiempos entre llegadas con ajuste Gamma."""
     if len(iats) < 50:
         return
 
@@ -236,129 +246,41 @@ def plot_inter_arrival_times(iats, profile, day_type):
     
     plt.figure()
     # Histograma de datos observados
-    sns.histplot(iats, stat="density", bins='auto', color="skyblue", alpha=0.4, label="Datos Observados")
+    sns.histplot(iats, stat="density", bins='auto', color="skyblue", alpha=0.5, label="Datos Observados")
     
     x = np.linspace(0, np.percentile(iats, 99.5), 1000)
     
-    # --- 1. Ajuste Paramétrico ---
-    distributions = [
-        ("Exponencial", stats.expon),
-        ("Lognormal", stats.lognorm),
-        ("Weibull", stats.weibull_min),
-        ("Gamma", stats.gamma)
-    ]
-    
-    best_param_name = None
-    best_param_ks = 1.0
-    best_param_p = 0.0
-    best_param_pdf = None
-    best_param_loglik = -np.inf
-    
-    for name, dist in distributions:
-        try:
-            if name == "Exponencial":
-                params = dist.fit(iats, floc=0)
-            else:
-                params = dist.fit(iats, floc=0)
-                
-            # KS Test
-            ks_stat, p_val = stats.kstest(iats, dist.name, args=params)
-            
-            # Log-Likelihood (Sum of logpdf)
-            loglik = np.sum(dist.logpdf(iats, *params))
-            
-            if ks_stat < best_param_ks:
-                best_param_ks = ks_stat
-                best_param_p = p_val
-                best_param_name = name
-                best_param_pdf = dist.pdf(x, *params)
-                best_param_loglik = loglik
-        except:
-            continue
-
-    # --- 2. Ajuste KDE (Búsqueda de Kernel) ---
-    best_kde_pdf = None
-    best_kde_label = "KDE"
-    best_kde_loglik = -np.inf
-    kde_success = False
-    
+    # Ajuste Gamma
     try:
-        from sklearn.neighbors import KernelDensity
-        from sklearn.model_selection import GridSearchCV
+        # Fit Gamma distribution
+        params = stats.gamma.fit(iats, floc=0)
+        shape, loc, scale = params
         
-        # Subsample para KDE grid search si es muy grande para velocidad
-        sample_for_grid = iats
-        if len(iats) > 2000:
-            sample_for_grid = np.random.choice(iats, 2000, replace=False)
-
-        bw_scott = np.std(sample_for_grid) * len(sample_for_grid)**(-0.2)
-        bandwidths = np.linspace(bw_scott * 0.5, bw_scott * 2, 5) # Reducido a 5 para velocidad
+        # KS Test
+        ks_stat, p_val = stats.kstest(iats, 'gamma', args=params)
         
-        grid = GridSearchCV(
-            KernelDensity(),
-            {'kernel': ['gaussian', 'tophat', 'epanechnikov', 'exponential'], 'bandwidth': bandwidths},
-            cv=3
-        )
-        grid.fit(sample_for_grid.reshape(-1, 1))
+        # Plot Gamma fit
+        gamma_pdf = stats.gamma.pdf(x, *params)
+        plt.plot(x, gamma_pdf, 'r-', lw=2.5, label=f'Gamma (shape={shape:.2f}, scale={scale:.2f})')
         
-        kde_model = grid.best_estimator_
-        # Recalcular score en full dataset (o subsample grande)
-        best_kde_loglik = kde_model.score(sample_for_grid.reshape(-1, 1)) * (len(iats)/len(sample_for_grid))
+        # Add statistics text box
+        stats_text = f"KS Test: p={p_val:.3f}\n"
+        stats_text += f"Media: {np.mean(iats):.1f}s\n"
+        stats_text += f"Mediana: {np.median(iats):.1f}s"
         
-        log_dens = kde_model.score_samples(x.reshape(-1, 1))
-        best_kde_pdf = np.exp(log_dens)
-        best_kde_label = f"KDE ({kde_model.kernel}, bw={kde_model.bandwidth:.2f})"
-        kde_success = True
+        plt.text(0.95, 0.95, stats_text, transform=plt.gca().transAxes, 
+                 ha='right', va='top', fontsize=9, 
+                 bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.9))
         
-    except ImportError:
-        try:
-            kde = stats.gaussian_kde(iats)
-            best_kde_pdf = kde(x)
-            best_kde_label = "KDE (Gaussian - Scipy)"
-            best_kde_loglik = np.sum(np.log(kde(iats)))
-            kde_success = True
-        except:
-            pass
     except Exception as e:
-        print(f"Error en KDE: {e}")
-
-    # --- 3. Plotting y Decisión ---
-    if best_param_name:
-        rejected = best_param_p < 0.05
-        style = 'r--' if rejected else 'r-'
-        label_txt = f"Paramétrica: {best_param_name}\n(p={best_param_p:.2e})"
-        plt.plot(x, best_param_pdf, style, lw=2, label=label_txt)
+        print(f"Error ajustando Gamma para {profile} - {day_type}: {e}")
     
-    if kde_success:
-        plt.plot(x, best_kde_pdf, 'k-.', lw=2.5, label=f"{best_kde_label}")
-    
-    use_kde = False
-    reason = ""
-    
-    if best_param_name is None:
-        use_kde = True
-        reason = "No fit paramétrico"
-    elif best_param_p < 0.05:
-        use_kde = True
-        reason = "Paramétrica Rechazada (p<0.05)"
-    else:
-        use_kde = False
-        reason = "Ajuste Paramétrico Aceptable"
-
-    decision_text = f"Recomendación: {'KDE' if use_kde else best_param_name}"
-    decision_sub = f"({reason})"
-    
-    color_box = "black" if use_kde else "darkgreen"
-    
-    plt.text(0.95, 0.95, f"{decision_text}\n{decision_sub}", transform=plt.gca().transAxes, 
-             ha='right', va='top', fontsize=10, fontweight='bold', color=color_box,
-             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.9))
-    
-    plt.title(f"Inter-Arrival Times Analysis\nProfile: {profile} | Day: {day_type}")
+    plt.title(f"Inter-Arrival Times (Gamma Distribution)\nProfile: {profile} | Day: {day_type}")
     plt.xlabel("Tiempo entre llegadas (s)")
     plt.ylabel("Densidad")
-    plt.legend()
+    plt.legend(loc='upper right')
     plt.xlim(0, np.percentile(iats, 99.5))
+    plt.grid(True, alpha=0.3)
     
     out_dir = ensure_subdir("arrivals/inter_arrival")
     filename = out_dir / f"arrival_{profile}_{day_type.replace(' ', '')}.png"
@@ -574,7 +496,7 @@ def plot_profit_regression(data_tuples, profile, priority, payment, day_type):
     plt.close()
 
 def plot_service_time_regression(data_tuples, lane_type, profile):
-    """Genera scatter plot de servicio por lane_type y profile, con modelo estocástico para SCO."""
+    """Genera scatter plot de servicio por lane_type y profile, comparando con el modelo configurado."""
     if len(data_tuples) < 20:
         return
 
@@ -590,39 +512,116 @@ def plot_service_time_regression(data_tuples, lane_type, profile):
     plt.figure()
     plt.scatter(x_obs, y_obs, alpha=0.3, s=15, c='gray', label='Datos Observados')
     
-    is_sco = str(lane_type).lower() in ["self_checkout", "sco", "autocaja"]
+    # Normalizar nombre de lane
+    norm_lane = str(lane_type).lower().strip()
+    if norm_lane in ["sco", "autocaja"]: norm_lane = "self_checkout"
     
-    if is_sco:
+    model_type = SERVICE_MODEL_DATA.get("type", "legacy")
+    
+    # Variables de estado
+    is_stochastic = False
+    is_linear = False
+    stoch_params = {}
+    lin_params = {}
+    
+    # 1. Detectar tipo de modelo para este lane
+    if model_type == "hybrid_multivariate_stochastic":
+        lane_model = SERVICE_MODEL_DATA.get("models", {}).get(norm_lane)
+        if lane_model:
+            method = lane_model.get("model_method")
+            if method == "stochastic_rate":
+                is_stochastic = True
+                stoch_params = lane_model.get("params", {})
+                title_suffix = "(Modelo Estocástico Ajustado)"
+            else:
+                is_linear = True
+                lin_params = lane_model
+                title_suffix = f"(Modelo Híbrido R2={lane_model.get('stats', {}).get('r2', 0):.2f})"
+                
+    elif model_type == "segmented_multivariate":
+        lane_model = SERVICE_MODEL_DATA.get("models", {}).get(norm_lane)
+        if lane_model:
+            is_linear = True
+            lin_params = lane_model
+            title_suffix = f"(Modelo Multivariado R2={lane_model.get('stats', {}).get('r2', 0):.2f})"
+            
+    elif model_type == "segmented_by_lane":
+        lane_model = SERVICE_MODEL_DATA.get("models", {}).get(norm_lane)
+        if lane_model:
+            is_linear = True
+            # Adaptar formato simple a generico
+            coeffs = lane_model.get("coeffs", {})
+            lin_params = {
+                "coeffs": {"Intercept": coeffs.get("intercept"), "items": coeffs.get("slope")}
+            }
+            title_suffix = f"(Modelo Ajustado R2={lane_model.get('stats', {}).get('r2', 0):.2f})"
+
+    # Fallback legacy para SCO si no hay modelo especifico
+    if not is_stochastic and not is_linear and norm_lane == "self_checkout":
+        is_stochastic = True
+        title_suffix = "(Modelo Estocástico Default)"
+        # Params default
+        stoch_params = {
+            "setup_time": 15.0,
+            "rate_dist": {"mu": 1.5, "sigma": 0.6}
+        }
+
+    # 2. Graficar según tipo
+    if is_linear:
+        coeffs = lin_params.get("coeffs", {})
+        intercept = float(coeffs.get("Intercept", 0.0))
+        slope = float(coeffs.get("items", 0.0))
+        
+        x_range = np.linspace(max(0, x_obs.min()), x_obs.max(), 100)
+        y_model = intercept + slope * x_range
+        
+        label_txt = f'Modelo Base (Int={intercept:.1f}, Slope={slope:.2f})'
+        if "multivariate" in model_type:
+            label_txt += " [+Efectos]"
+            
+        plt.plot(x_range, y_model, 'r-', lw=2.5, label=label_txt)
+        
+    elif is_stochastic:
+        # Extraer parametros
+        setup = float(stoch_params.get("setup_time", 15.0))
+        dist_params = stoch_params.get("rate_dist", {})
+        mu = float(dist_params.get("mu", 1.5))
+        sigma = float(dist_params.get("sigma", 0.6))
+        
         x_sim = np.linspace(1, max(x_obs.max(), 20), 50)
         p05, p50, p95 = [], [], []
         rng = np.random.default_rng(42)
         
         for items in x_sim:
             n_sim = 1000
-            # Setup: max(5.0, Normal(15.0, 5.0))
-            setup = np.maximum(5.0, rng.normal(15.0, 5.0, n_sim))
-            # Rate: Lognormal(mean=1.5, sigma=0.6)
-            rate = rng.lognormal(1.5, 0.6, n_sim)
-            rate = np.clip(rate, 0.5, 60.0)
-            times = setup + items * rate
+            # Setup con ruido para visualizacion realista
+            setup_val = np.maximum(5.0, rng.normal(setup, 5.0, n_sim))
+            
+            rate = rng.lognormal(mu, sigma, n_sim)
+            rate = np.clip(rate, 0.1, 120.0)
+            times = setup_val + items * rate
             
             p05.append(np.percentile(times, 5))
             p50.append(np.median(times))
             p95.append(np.percentile(times, 95))
             
-        plt.plot(x_sim, p50, 'r-', lw=2, label='Mediana Teórica (Estocástica)')
-        plt.fill_between(x_sim, p05, p95, color='red', alpha=0.15, label='Rango Esperado (5%-95%)')
-        title_suffix = "(Modelo Estocástico: Setup~N(15,5), Rate~LogN(1.5, 0.6))"
+        plt.plot(x_sim, p50, 'r-', lw=2, label=f'Mediana (Setup={setup:.0f}, Rate~LogN)')
+        plt.fill_between(x_sim, p05, p95, color='red', alpha=0.15, label='Rango 5%-95%')
+
     else:
+        # Fallback total
         df_sample = pd.DataFrame({'items': x_obs, 'service_time_s': y_obs})
-        sns.regplot(
-            data=df_sample, 
-            x="items", 
-            y="service_time_s", 
-            scatter=False,
-            line_kws={'color':'red', 'label': 'Regresión Lineal'}
-        )
-        title_suffix = f"(Corr: {df_sample['items'].corr(df_sample['service_time_s']):.2f})"
+        if len(df_sample) > 1 and df_sample['items'].std() > 0:
+             sns.regplot(
+                data=df_sample, 
+                x="items", 
+                y="service_time_s", 
+                scatter=False,
+                line_kws={'color':'red', 'label': 'Regresión Lineal (Ad-hoc)'}
+            )
+             title_suffix = f"(Corr: {df_sample['items'].corr(df_sample['service_time_s']):.2f})"
+        else:
+             title_suffix = "(Datos Insuficientes)"
     
     plt.title(f"Service Time Model {title_suffix}\nLane: {lane_type} | Profile: {profile}")
     plt.xlabel("Cantidad de Ítems")

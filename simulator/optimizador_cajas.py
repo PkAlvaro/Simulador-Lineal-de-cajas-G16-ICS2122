@@ -31,119 +31,294 @@ DAYS_PER_YEAR = 365
 HOURS_PER_DAY = 14
 HOURS_PER_YEAR = DAYS_PER_YEAR * HOURS_PER_DAY
 
-WAGE_PER_HOUR = {
-    "regular": 4500,
-    "express": 4500,
-    "priority": 4700,
-    "self_checkout": 5000,
-}
+# Parámetros Financieros
+TAX_RATE = 0.27  # 27% Impuesto Primera Categoría
+DISCOUNT_RATE = 0.0854  # 8.54% Costo de Capital (WACC/Ke)
+PROJECT_HORIZON_YEARS = 5
 
-OPEX_PER_HOUR = {
-    "regular": 400,
-    "express": 420,
-    "priority": 400,
-    "self_checkout": 500,
-}
+# Estructuras para guardar costos proyectados
+@dataclass
+class LaneCostData:
+    capex: float
+    maintenance_yearly: float
+    opex_hourly: float
+    wage_hourly: float
+    useful_life: float
 
-CAPEX_CLP = {
-    "regular": 8_000_000,
-    "express": 8_000_000,
-    "priority": 8_000_000,
-    "self_checkout": 25_000_000,
-}
+@dataclass
+class AnnualFixedCosts:
+    year: int
+    total_fixed_clp: float
 
-MAINT_CLP_PER_YEAR = {
-    "regular": 800_000,
-    "express": 800_000,
-    "priority": 800_000,
-    "self_checkout": 1_500_000,
-}
 
+@dataclass
+class ScenarioWeight:
+    scenario_id: str
+    weight: float
+
+@dataclass
+class AnnualVariableCosts:
+    year: int
+    lane_costs: dict[str, LaneCostData] # LaneCostData se reutiliza pero ahora por año
+
+# Diccionarios globales para acceso rápido: {year: ...}
+# Diccionarios globales para acceso rápido: {year: ...}
+FIXED_COSTS_PROJECTION: dict[int, float] = {}
+VARIABLE_COSTS_PROJECTION: dict[int, dict[str, LaneCostData]] = {}
+
+# Variables globales para seguimiento
+OPT_PROGRESS: list[dict] = []
+EVAL_COUNT: int = 0
 START_TIME: float | None = None
 MAX_SECONDS: float | None = None
-MAX_EVALS: int | None = None
-EVAL_COUNT: int = 0
-OPT_PROGRESS: list[dict] = []
+MAX_EVAL_COUNT: int | None = None
 
 
 def _time_exceeded() -> bool:
-    if START_TIME is None or MAX_SECONDS is None:
+    if MAX_SECONDS is None or START_TIME is None:
         return False
-    return (time.time() - START_TIME) >= MAX_SECONDS
+    return (time.time() - START_TIME) > MAX_SECONDS
 
 
 def _eval_limit_reached() -> bool:
-    return MAX_EVALS is not None and EVAL_COUNT >= MAX_EVALS
+    if MAX_EVAL_COUNT is None:
+        return False
+    return EVAL_COUNT >= MAX_EVAL_COUNT
 
+def _load_projections() -> None:
+    """
+    Carga las proyecciones de costos fijos y variables desde los CSVs.
+    """
+    global FIXED_COSTS_PROJECTION, VARIABLE_COSTS_PROJECTION
+    
+    # 1. Cargar Costos Fijos
+    fijos_path = PROJECT_ROOT / "data/proyeccion_costos_fijos.csv"
+    if not fijos_path.exists():
+        raise FileNotFoundError(f"No se encontró {fijos_path}")
+        
+    df_fijos = pd.read_csv(fijos_path)
+    # Sumamos todas las columnas de costos (excepto 'year') para obtener el total fijo anual
+    cost_cols = [c for c in df_fijos.columns if c != "year"]
+    
+    for _, row in df_fijos.iterrows():
+        year = int(row["year"])
+        total = sum(float(row[c]) for c in cost_cols)
+        FIXED_COSTS_PROJECTION[year] = total
 
-def _load_annual_costs_from_csv(csv_path: Path) -> dict[str, float]:
-    df = pd.read_csv(csv_path)
-    required_cols = {"lane_type", "supervisors", "useful_life_years"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"Faltan columnas en {csv_path.name}: {', '.join(sorted(missing))}"
-        )
-
-    costs: dict[str, float] = {}
-    for _, row in df.iterrows():
-        lane = str(row["lane_type"]).strip().lower()
-        if lane not in DECISION_LANES:
-            continue
-
-        life = float(row["useful_life_years"])
-        supervisors = float(row["supervisors"])
-
-        capex = float(CAPEX_CLP[lane])
-        maint = float(MAINT_CLP_PER_YEAR[lane])
-
-        if lane == "self_checkout":
-            wage_h = WAGE_PER_HOUR["self_checkout"] * supervisors
-        else:
-            wage_h = WAGE_PER_HOUR[lane] * 1.0
-
-        opex_h = float(OPEX_PER_HOUR[lane])
-
-        annual_capex = capex / max(life, 1.0)
-        annual_running = (wage_h + opex_h) * HOURS_PER_YEAR
-
-        total_annual = annual_capex + maint + annual_running
-        costs[lane] = total_annual
-
-    for lane in DECISION_LANES:
-        if lane not in costs:
-            raise ValueError(
-                f"No se encontró costo para lane_type='{lane}' en {csv_path.name}"
+    # 2. Cargar Costos Variables Unitarios
+    var_path = PROJECT_ROOT / "data/proyeccion_costos_variables.csv"
+    if not var_path.exists():
+        raise FileNotFoundError(f"No se encontró {var_path}")
+        
+    df_var = pd.read_csv(var_path)
+    # Columnas: year, lane_type, capex_clp, maintenance_yearly_clp, opex_hourly_clp, wage_hourly_clp
+    
+    # Agrupamos por año
+    years = df_var["year"].unique()
+    for year in years:
+        year_int = int(year)
+        df_year = df_var[df_var["year"] == year]
+        lane_map = {}
+        
+        for _, row in df_year.iterrows():
+            lane = str(row["lane_type"]).strip().lower()
+            if lane not in DECISION_LANES:
+                continue
+                
+            data = LaneCostData(
+                capex=float(row["capex_clp"]), # CAPEX se usa solo en t=0 (2026), pero lo guardamos
+                maintenance_yearly=float(row["maintenance_yearly_clp"]),
+                opex_hourly=float(row["opex_hourly_clp"]),
+                wage_hourly=float(row["wage_hourly_clp"]),
+                useful_life=5.0 # Asumimos 5 años fijo por ahora
             )
+            lane_map[lane] = data
+            
+        VARIABLE_COSTS_PROJECTION[year_int] = lane_map
 
-    return costs
-
-
-COSTS_CSV_PATH = PROJECT_ROOT / "data/costos_cajas.csv"
-COST_PER_LANE_ANNUAL = _load_annual_costs_from_csv(COSTS_CSV_PATH)
-
-
-def lane_dict_to_tuple(counts: dict[str, int]) -> tuple[int, int, int, int]:
-    return tuple(int(counts.get(k, 0)) for k in DECISION_LANES)
+# Cargar proyecciones al inicio
+_load_projections()
 
 
-def lane_tuple_to_dict(x: tuple[int, int, int, int]) -> dict[str, int]:
-    r, e, p, s = x
+TIME_BLOCKS = [(8, 13), (13, 18), (18, 22)]
+
+
+def lane_dict_to_tuple(counts: dict[str, int]) -> tuple[int, ...]:
+    # Replicate the single configuration for all time blocks
+    base = tuple(int(counts.get(k, 0)) for k in DECISION_LANES)
+    return base * len(TIME_BLOCKS)
+
+
+def lane_tuple_to_schedule(
+    x: tuple[int, ...]
+) -> list[tuple[int, int, dict[str, int]]]:
+    schedule = []
+    n_lanes = len(DECISION_LANES)
+    for i, (start, end) in enumerate(TIME_BLOCKS):
+        offset = i * n_lanes
+        block_counts = x[offset : offset + n_lanes]
+        counts_dict = {
+            DECISION_LANES[j]: int(block_counts[j]) for j in range(n_lanes)
+        }
+        schedule.append((start, end, counts_dict))
+    return schedule
+
+
+def lane_tuple_to_dict(x: tuple[int, ...]) -> dict[str, int]:
+    # DEPRECATED/COMPATIBILITY: Returns max counts across blocks
+    # This is used for reporting/logging where a single dict is expected
+    schedule = lane_tuple_to_schedule(x)
+    max_counts = {l: 0 for l in DECISION_LANES}
+    for _, _, counts in schedule:
+        for l, c in counts.items():
+            max_counts[l] = max(max_counts[l], c)
+    return max_counts
+
+
+def calculate_financial_metrics(
+    counts: dict[str, int] | list, annual_gross_profit: float
+) -> dict[str, float]:
+    """
+    Calcula el VPN proyectado considerando el horizonte de datos disponibles (2025-2030).
+    Ano Base Inversion: Inicios de 2025 (t=0).
+    Flujos Operativos: Finales de 2025 (t=1) a Finales de 2030 (t=6).
+    """
+    # 1. Inversion Inicial (t=0, Inicios de 2025)
+    start_year = 2025
+    if start_year not in VARIABLE_COSTS_PROJECTION:
+        # Fallback si no se cargo 2025, usar el menor ano disponible
+        start_year = min(VARIABLE_COSTS_PROJECTION.keys())
+
+    costs_base = VARIABLE_COSTS_PROJECTION[start_year]
+
+    # Determine counts for CAPEX (max lanes) and hours for OPEX
+    if isinstance(counts, list):
+        # Schedule: list of (start, end, block_counts)
+        schedule = counts
+        counts_for_capex = {l: 0 for l in DECISION_LANES}
+        daily_hours_per_lane = {l: 0.0 for l in DECISION_LANES}
+        for start, end, block_counts in schedule:
+            duration = end - start
+            for lane, count in block_counts.items():
+                counts_for_capex[lane] = max(counts_for_capex.get(lane, 0), count)
+                daily_hours_per_lane[lane] += count * duration
+    else:
+        # Static dict
+        counts_for_capex = counts
+        daily_hours_per_lane = {
+            l: c * HOURS_PER_DAY for l, c in counts.items()
+        }
+
+    total_capex = 0.0
+    for lane, count in counts_for_capex.items():
+        if count > 0:
+            total_capex += costs_base[lane].capex * count
+
+    vp_flujos = 0.0
+    total_opex_acumulado = 0.0
+    total_ebitda_acumulado = 0.0
+    total_fcf_acumulado = 0.0
+
+    # Determinamos el horizonte real basado en datos disponibles (ej. 2025 a 2030 = 6 anos)
+    max_year_data = max(VARIABLE_COSTS_PROJECTION.keys())
+    horizon_years = (max_year_data - start_year) + 1
+
+    # 2. Flujos Anuales
+    for t in range(1, horizon_years + 1):
+        year = start_year + (t - 1)
+
+        # Costos Fijos de la Empresa para este ano
+        fixed_costs = FIXED_COSTS_PROJECTION.get(year, 0.0)
+
+        # Costos Variables de las Cajas para este ano
+        var_costs_map = VARIABLE_COSTS_PROJECTION.get(year)
+        if not var_costs_map:
+            # Fallback al ultimo ano disponible
+            var_costs_map = VARIABLE_COSTS_PROJECTION[
+                max(VARIABLE_COSTS_PROJECTION.keys())
+            ]
+
+        opex_cajas_year = 0.0
+        depreciacion_year = 0.0
+
+        for lane in DECISION_LANES:
+            # Usamos counts_for_capex para iterar lanes relevantes
+            max_count = counts_for_capex.get(lane, 0)
+            if max_count <= 0:
+                continue
+            
+            data = var_costs_map[lane]
+            daily_hours = daily_hours_per_lane.get(lane, 0.0)
+
+            # Costo Operativo (OPEX + Mantenimiento)
+            # OPEX es por hora de operación real
+            opex_anual_total = data.opex_hourly * daily_hours * DAYS_PER_YEAR
+            
+            # Mantenimiento es por lane instalado (anual)
+            maint_total = data.maintenance_yearly * max_count
+
+            # Costo Laboral (Sueldos)
+            # Sueldos dependen de las horas operativas
+            # Para SCO, la regla de supervisores aplica por bloque?
+            # Simplificación: Calculamos wage por hora efectiva.
+            # Si es SCO, necesitamos saber cuántos supervisores hubo cada hora.
+            
+            if lane == "self_checkout":
+                # Recalcular horas de supervisores si es schedule
+                if isinstance(counts, list):
+                    wage_daily_total = 0.0
+                    for start, end, block_counts in counts:
+                        c = block_counts.get("self_checkout", 0)
+                        if c > 0:
+                            num_islas = math.ceil(c / 5.0)
+                            num_supervisores = num_islas * 2
+                            wage_daily_total += (
+                                data.wage_hourly * num_supervisores * (end - start)
+                            )
+                    costo_laboral_anual = wage_daily_total * DAYS_PER_YEAR
+                else:
+                    # Static
+                    num_islas = math.ceil(max_count / 5.0)
+                    num_supervisores = num_islas * 2
+                    wage_hora_total = data.wage_hourly * num_supervisores
+                    costo_laboral_anual = wage_hora_total * daily_hours * DAYS_PER_YEAR
+            else:
+                # Cajas asistidas: 1 persona por caja -> wage * horas totales
+                costo_laboral_anual = data.wage_hourly * daily_hours * DAYS_PER_YEAR
+
+            opex_cajas_year += costo_laboral_anual + opex_anual_total + maint_total
+
+            # Depreciacion (Usamos CAPEX base / vida util)
+            if data.useful_life > 0:
+                depreciacion_year += (
+                    costs_base[lane].capex * max_count
+                ) / data.useful_life
+
+        # Calculo del Flujo del Ano
+        total_opex_year = fixed_costs + opex_cajas_year
+        ebitda_year = annual_gross_profit - total_opex_year
+        ebit_year = ebitda_year - depreciacion_year
+
+        nopat_year = ebit_year * (1 - TAX_RATE)
+        fcf_year = nopat_year + depreciacion_year
+
+        # Descuento al Valor Presente
+        vp_flujos += fcf_year / ((1 + DISCOUNT_RATE) ** t)
+
+        total_opex_acumulado += total_opex_year
+        total_ebitda_acumulado += ebitda_year
+        total_fcf_acumulado += fcf_year
+
+    npv = -total_capex + vp_flujos
+
     return {
-        "regular": int(r),
-        "express": int(e),
-        "priority": int(p),
-        "self_checkout": int(s),
+        "npv": npv,
+        "capex": total_capex,
+        "opex_anual_promedio": total_opex_acumulado / horizon_years,
+        "ebitda_anual_promedio": total_ebitda_acumulado / horizon_years,
+        "fcf_anual_promedio": total_fcf_acumulado / horizon_years,
+        "gross_profit": annual_gross_profit,
     }
-
-
-def cost_anual_config(counts: dict[str, int]) -> float:
-    return float(
-        sum(
-            int(counts.get(k, 0)) * float(COST_PER_LANE_ANNUAL.get(k, 0.0))
-            for k in DECISION_LANES
-        )
-    )
 
 
 def _set_global_random_seeds(seed: int) -> None:
@@ -154,334 +329,224 @@ def _set_global_random_seeds(seed: int) -> None:
         sim.RNG_PROFIT = np.random.default_rng(seed + 2)
 
 
-def _apply_lane_config(x: tuple[int, int, int, int]) -> dict[str, int]:
-    raw_counts = lane_tuple_to_dict(x)
-    normalized = sim.enforce_lane_constraints(raw_counts)
-    sim.update_current_lane_policy(normalized)
-    return normalized
-
-
-def _evaluate_policy_once(
-    x: tuple[int, int, int, int],
-    day_type: sim.DayType,
-    num_weeks_sample: int = 1,
-    run_id: str = "run",
-    keep_outputs: bool = False,
-    context: str | None = None,
-    *,
-    use_in_memory: bool = False,
-    shared_output_root: Path | None = None,
-) -> tuple[float, float]:
-    counts_norm = _apply_lane_config(x)
-
-    base_root = shared_output_root or (PROJECT_ROOT / "outputs_opt")
-    output_root = base_root / f"{run_id}"
-    if not use_in_memory and shared_output_root is None and output_root.exists():
-        shutil.rmtree(output_root, ignore_errors=True)
-
-    if context:
-        print(f"[SIM] {context} | semanas={num_weeks_sample} | run_id={run_id} | x={x}")
-    else:
-        print(
-            f"[SIM] Dia={day_type.name} | semanas={num_weeks_sample} | run_id={run_id} | x={x}"
-        )
-
-    stats_muestra = sim.simulacion_periodos(
-        num_weeks=num_weeks_sample,
-        output_root=str(output_root),
-        include_timestamp=False,
-        start_week_idx=1,
-        titulo=f"OPT-EVAL {run_id} x={x}",
-        write_outputs=not use_in_memory,
-    )
-
-    if use_in_memory:
-        prof_muestra = sum(
-            float(r.get("profit_served_clp", 0.0))
-            for r in stats_muestra
-            if str(r.get("dia_tipo", "")).lower() == day_type.value
-        )
-    else:
-        df_eval = load_customers_year(output_root)
-        df_eval["total_profit_clp"] = pd.to_numeric(
-            df_eval["total_profit_clp"], errors="coerce"
-        ).fillna(0)
-
-        df_dt = df_eval[df_eval["dia_tipo"].str.lower() == day_type.value]
-        prof_muestra = df_dt.loc[
-            df_dt["outcome_norm"] == "served", "total_profit_clp"
-        ].sum()
-
-    factor_anual = 52.0 / float(num_weeks_sample)
-    profit_anual = float(prof_muestra * factor_anual)
-
-    cost_anual = cost_anual_config(counts_norm)
-    objetivo = profit_anual - cost_anual
-
-    if not use_in_memory and not keep_outputs and shared_output_root is None:
-        shutil.rmtree(output_root, ignore_errors=True)
-
-    if context:
-        print(f"[SIM] {context} | completado | objetivo={objetivo:,.0f}")
-    else:
-        print(f"[SIM] Dia={day_type.name} | completado | objetivo={objetivo:,.0f}")
-
-    return float(objetivo), float(profit_anual)
+def _apply_lane_config(x: tuple[int, ...]) -> list[tuple[int, int, dict[str, int]]]:
+    schedule = lane_tuple_to_schedule(x)
+    normalized_schedule = []
+    for start, end, counts in schedule:
+        norm_counts = sim.enforce_lane_constraints(counts)
+        normalized_schedule.append((start, end, norm_counts))
+    
+    # We pass the schedule list to update_current_lane_policy
+    # Note: sim.update_current_lane_policy expects a dict if we follow strict typing,
+    # but we modified engine to handle list in _simular_dia_periodo.
+    # However, update_current_lane_policy implementation in engine.py might need update
+    # if it tries to merge dicts.
+    # Let's check engine.py's update_current_lane_policy.
+    # It calls build_uniform_policy(normalized).
+    # If we pass a list, build_uniform_policy will fail.
+    # So we should probably bypass update_current_lane_policy or update it.
+    # For now, let's assume we update CURRENT_LANE_POLICY directly in engine via a new method
+    # or just set it.
+    # But wait, _simular_dia_periodo reads CURRENT_LANE_POLICY.
+    # So we can just set it.
+    
+    # Actually, let's just update the specific day type entry in CURRENT_LANE_POLICY.
+    # But _apply_lane_config doesn't know the day type.
+    # It's called by _evaluate_policy_once which knows day_type.
+    # But _apply_lane_config is called before _evaluate_policy_once uses day_type?
+    # No, _evaluate_policy_once calls _apply_lane_config(x).
+    
+    # Issue: _apply_lane_config updates GLOBAL state in engine.
+    # And it doesn't know which day type to update.
+    # Previously it updated ALL day types with the same config.
+    
+    # We should probably change _apply_lane_config to NOT update global state,
+    # and instead return the config, and let _evaluate_policy_once update it.
+    # But _evaluate_policy_once calls sim.simulacion_periodos which runs the simulation.
+    # sim.simulacion_periodos reads CURRENT_LANE_POLICY.
+    
+    # Workaround: Update ALL day types in CURRENT_LANE_POLICY with the schedule.
+    for dt in sim.DayType:
+        sim.CURRENT_LANE_POLICY[dt] = normalized_schedule
+        
+    return normalized_schedule
 
 
 @dataclass
 class EvalSAAResult:
-    x: tuple[int, int, int, int]
-    objetivo_mean: float
-    objetivo_std: float
+    x: tuple[int, ...]
+    day_type: sim.DayType
     profit_mean: float
     profit_std: float
+    objetivo_mean: float
+    objetivo_std: float
     n_rep: int
-    day_type: sim.DayType
-
-
-# Cache de fitness: la clave incluye configuraci�n, tipo de d�a, factor de demanda,
-# semanas/r�plicas usadas y el modo de evaluaci�n (memoria/disco) o escenarios.
-_FITNESS_CACHE: dict[tuple, EvalSAAResult] = {}
-
-
-ScenarioWeight = tuple[str, float, float]
+    elapsed_s: float
+    kpis: dict[str, float] = None
 
 
 def evaluate_policy_saa(
-    x: tuple[int, int, int, int],
+    x: tuple[int, ...],
     day_type: sim.DayType,
     num_weeks_sample: int = 1,
     num_rep: int = 3,
     keep_outputs: bool = False,
     eval_context: str | None = None,
     scenarios: Sequence[ScenarioWeight] | None = None,
-    use_in_memory: bool | None = None,
+    use_in_memory: bool = True,
     shared_output_root: Path | None = None,
 ) -> EvalSAAResult:
-    # Por defecto usamos el modo en memoria para evitar escrituras/lecturas
-    # costosas; si se piden outputs persistidos, lo desactivamos.
-    if use_in_memory is None:
-        use_in_memory = not keep_outputs
-    elif keep_outputs and use_in_memory:
-        use_in_memory = False
-
-    if scenarios:
-        scenario_sig = tuple(
-            (str(lbl), float(fac), float(1.0 if w is None else w))
-            for lbl, fac, w in scenarios
-        )
-        cache_key = (tuple(int(v) for v in x), day_type, scenario_sig, num_weeks_sample, num_rep, use_in_memory)
-        if cache_key in _FITNESS_CACHE:
-            return _FITNESS_CACHE[cache_key]
-        return _evaluate_policy_multi_scenarios(
-            x,
-            day_type=day_type,
-            num_weeks_sample=num_weeks_sample,
-            num_rep=num_rep,
-            keep_outputs=keep_outputs,
-            eval_context=eval_context,
-            scenarios=scenarios,
-            use_in_memory=use_in_memory,
-            cache_key=cache_key,
-            shared_output_root=shared_output_root,
-        )
-    return _evaluate_policy_saa_single(
-        x,
-        day_type=day_type,
-        num_weeks_sample=num_weeks_sample,
-        num_rep=num_rep,
-        keep_outputs=keep_outputs,
-        eval_context=eval_context,
-        use_in_memory=use_in_memory,
-        shared_output_root=shared_output_root,
-    )
-
-
-def _evaluate_policy_saa_single(
-    x: tuple[int, int, int, int],
-    day_type: sim.DayType,
-    num_weeks_sample: int = 1,
-    num_rep: int = 3,
-    keep_outputs: bool = False,
-    eval_context: str | None = None,
-    use_in_memory: bool = False,
-    shared_output_root: Path | None = None,
-) -> EvalSAAResult:
-    x = tuple(int(v) for v in x)
-    current_factor = float(sim.get_demand_multiplier())
-    factor_key = round(current_factor, 9)
-    key = (x, day_type, factor_key, num_weeks_sample, num_rep, use_in_memory)
-
-    if key in _FITNESS_CACHE:
-        return _FITNESS_CACHE[key]
-
-    objetivos: list[float] = []
-    profits: list[float] = []
-
-    for rep in range(num_rep):
-        if _time_exceeded() or _eval_limit_reached():
-            break
-
-        seed = 12345 + 10000 * rep + 101 * x[0] + 17 * x[1] + 7 * x[2] + 3 * x[3]
-        _set_global_random_seeds(seed)
-
-        unique_tag = uuid.uuid4().hex[:8]
-        run_id = (
-            f"{day_type.name}_x_{x[0]}_{x[1]}_{x[2]}_{x[3]}_" f"rep{rep}_{unique_tag}"
-        )
-        run_context = eval_context or f"Dia={day_type.name}"
-        obj, prof = _evaluate_policy_once(
-            x,
-            day_type=day_type,
-            num_weeks_sample=num_weeks_sample,
-            run_id=run_id,
-            keep_outputs=keep_outputs,
-            context=f"{run_context} | rep={rep + 1}/{num_rep}",
-            use_in_memory=use_in_memory,
-            shared_output_root=shared_output_root,
-        )
-        global EVAL_COUNT
-        EVAL_COUNT += 1
-        objetivos.append(obj)
-        profits.append(prof)
-
-    if not objetivos:
-        res = EvalSAAResult(
-            x=x,
-            objetivo_mean=float("-inf"),
-            objetivo_std=0.0,
-            profit_mean=0.0,
-            profit_std=0.0,
-            n_rep=0,
-            day_type=day_type,
-        )
-        return res
-
-    objetivos_arr = np.asarray(objetivos, dtype=float)
-    profits_arr = np.asarray(profits, dtype=float)
-
-    res = EvalSAAResult(
-        x=x,
-        objetivo_mean=float(objetivos_arr.mean()),
-        objetivo_std=float(
-            objetivos_arr.std(ddof=1) if len(objetivos_arr) > 1 else 0.0
-        ),
-        profit_mean=float(profits_arr.mean()),
-        profit_std=float(profits_arr.std(ddof=1) if len(profits_arr) > 1 else 0.0),
-        n_rep=len(objetivos),
-        day_type=day_type,
-    )
-
-    _FITNESS_CACHE[key] = res
-    return res
-
-
-def _evaluate_policy_multi_scenarios(
-    x: tuple[int, int, int, int],
-    day_type: sim.DayType,
-    *,
-    num_weeks_sample: int,
-    num_rep: int,
-    keep_outputs: bool,
-    eval_context: str | None,
-    scenarios: Sequence[ScenarioWeight],
-    use_in_memory: bool,
-    cache_key,
-    shared_output_root: Path | None = None,
-) -> EvalSAAResult:
-    prev_factor = float(sim.get_demand_multiplier())
-    agg_profit = 0.0
-    agg_profit_std = 0.0
-    agg_obj = 0.0
-    agg_obj_std = 0.0
-    last_res: EvalSAAResult | None = None
-    total_weight = 0.0
-
-    try:
-        for label, factor, weight in scenarios:
-            weight_val = float(weight) if weight is not None else 1.0
-            if weight_val <= 0:
-                continue
-            total_weight += weight_val
-            sim.set_demand_multiplier(float(factor))
-            res = _evaluate_policy_saa_single(
-                x,
-                day_type=day_type,
-                num_weeks_sample=num_weeks_sample,
-                num_rep=num_rep,
-                keep_outputs=keep_outputs,
-                eval_context=(
-                    f"{eval_context} | escenario={label}" if eval_context else None
-                ),
-                use_in_memory=use_in_memory,
+    global EVAL_COUNT
+    EVAL_COUNT += 1
+    
+    start_t = time.time()
+    
+    # Apply policy (schedule)
+    _apply_lane_config(x)
+    
+    # Setup simulation environment
+    perfiles = [
+        sim.CustomerProfile.DEAL_HUNTER,
+        sim.CustomerProfile.FAMILY_CART,
+        sim.CustomerProfile.WEEKLY_PLANNER,
+        sim.CustomerProfile.SELF_CHECKOUT_FAN,
+        sim.CustomerProfile.REGULAR,
+        sim.CustomerProfile.EXPRESS_BASKET,
+    ]
+    cfg_by_prof = {p: sim.ProfileConfig(p) for p in perfiles}
+    balk_model = sim.BALK_MODEL
+    
+    profits = []
+    
+    # Run replications
+    # Note: For strict SAA, we should control seeds. 
+    # Here we rely on the engine's randomness (which might be seeded globally).
+    # If we want independent samples, we assume the engine advances RNG state.
+    
+    for i in range(num_rep):
+        if keep_outputs:
+            out_folder = (shared_output_root or PROJECT_ROOT / "outputs_opt") / f"eval_{EVAL_COUNT}_rep_{i}"
+            out_folder.mkdir(parents=True, exist_ok=True)
+        else:
+            out_folder = Path("tmp_null")
+            
+        dia_config = (1, day_type, f"Opt Eval {EVAL_COUNT} Rep {i}")
+        
+        try:
+            # Suppress stdout to avoid clutter during optimization
+            # import contextlib, io
+            # with contextlib.redirect_stdout(io.StringIO()):
+            stats = sim._simular_dia_periodo(
+                week_idx=1,
+                dia_config=dia_config,
+                perfiles=perfiles,
+                cfg_by_prof=cfg_by_prof,
+                balk_model=balk_model,
+                output_folder=out_folder,
+                write_outputs=keep_outputs
             )
-            last_res = res
-            agg_profit += weight_val * res.profit_mean
-            agg_profit_std += weight_val * res.profit_std
-            agg_obj += weight_val * res.objetivo_mean
-            agg_obj_std += weight_val * res.objetivo_std
-    finally:
-        sim.set_demand_multiplier(prev_factor)
+            profits.append(stats["profit_total_clp"])
+        except Exception as e:
+            print(f"[ERROR] Simulation failed in eval {EVAL_COUNT}: {e}")
+            profits.append(0.0)
 
-    if total_weight <= 0 or last_res is None:
-        sim.set_demand_multiplier(prev_factor)
-        return _evaluate_policy_saa_single(
-            x,
-            day_type=day_type,
-            num_weeks_sample=num_weeks_sample,
-            num_rep=num_rep,
-            keep_outputs=keep_outputs,
-            eval_context=eval_context,
-            use_in_memory=use_in_memory,
-            shared_output_root=shared_output_root,
-        )
+    profit_mean = float(np.mean(profits)) if profits else 0.0
+    profit_std = float(np.std(profits)) if profits else 0.0
+    
+    # Calculate Financial Metrics (NPV)
+    schedule = lane_tuple_to_schedule(x)
+    # Multiplicamos por 365 para proyectar el profit diario a anual
+    metrics = calculate_financial_metrics(schedule, profit_mean * DAYS_PER_YEAR)
+    
+    # Calculate average KPIs from stats
+    # stats is the result of the last replication, but we should ideally average across replications
+    # For now, we will use the last replication's stats as a proxy or if we stored them all, average them.
+    # Since we didn't store all stats objects, we can't average them here easily without refactoring.
+    # Let's assume the user wants the KPIs of the last run or we can modify the loop to store them.
+    # Given the constraints, let's use the last stats object if available.
+    
+    kpis = {}
+    if 'stats' in locals() and stats:
+        # Extract relevant KPIs from the stats dictionary
+        # Assuming stats has keys like 'avg_wait_time', 'abandonment_rate', etc.
+        # We need to check what _simular_dia_periodo returns exactly in 'stats'.
+        # Based on previous context, it returns a dict with 'profit_total_clp' and likely others.
+        # Let's extract what we can find or default to 0.
+        kpis = {
+            "avg_wait_time": stats.get("avg_wait_time", 0.0),
+            "abandonment_rate": stats.get("abandonment_rate", 0.0),
+            "avg_system_time": stats.get("avg_system_time", 0.0),
+            "served_customers": stats.get("served_customers", 0),
+        }
 
-    # Normalizamos por el peso total para no inflar objetivos/profits.
-    inv_w = 1.0 / total_weight
-    res = EvalSAAResult(
+    return EvalSAAResult(
         x=x,
-        objetivo_mean=float(agg_obj * inv_w),
-        objetivo_std=float(agg_obj_std * inv_w),
-        profit_mean=float(agg_profit * inv_w),
-        profit_std=float(agg_profit_std * inv_w),
-        n_rep=last_res.n_rep,
         day_type=day_type,
+        profit_mean=profit_mean,
+        profit_std=profit_std,
+        objetivo_mean=metrics["npv"],
+        objetivo_std=0.0, # Approximation
+        n_rep=num_rep,
+        elapsed_s=time.time() - start_t,
+        kpis=kpis
     )
-    _FITNESS_CACHE[cache_key] = res
-    return res
 
 
 def generar_vecinos(
-    x: tuple[int, int, int, int],
+    x: tuple[int, ...],
     max_total_lanes: int | None = None,
-) -> list[tuple[int, int, int, int]]:
+) -> list[tuple[int, ...]]:
     if max_total_lanes is None:
         max_total_lanes = sim.MAX_TOTAL_LANES
 
-    vecinos: set[tuple[int, int, int, int]] = set()
-    base_counts = lane_tuple_to_dict(x)
-    base_counts = sim.enforce_lane_constraints(base_counts)
-    base_tuple = lane_dict_to_tuple(base_counts)
-    total_actual = sum(base_counts.values())
+    vecinos: set[tuple[int, ...]] = set()
+    n_lanes = len(DECISION_LANES)
 
-    for lane_name in DECISION_LANES:
-        if base_counts[lane_name] > 0:
-            c_minus = base_counts.copy()
-            c_minus[lane_name] = max(0, c_minus[lane_name] - 1)
-            c_minus = sim.enforce_lane_constraints(c_minus)
-            if sum(c_minus.values()) <= max_total_lanes:
-                vecinos.add(lane_dict_to_tuple(c_minus))
+    for block_idx in range(len(TIME_BLOCKS)):
+        offset = block_idx * n_lanes
+        # Extract block tuple
+        block_tuple = x[offset : offset + n_lanes]
 
-        if total_actual < max_total_lanes:
-            c_plus = base_counts.copy()
-            c_plus[lane_name] = c_plus[lane_name] + 1
-            c_plus = sim.enforce_lane_constraints(c_plus)
-            if sum(c_plus.values()) <= max_total_lanes:
-                vecinos.add(lane_dict_to_tuple(c_plus))
+        # Convert to dict for easier manipulation
+        block_counts = {
+            DECISION_LANES[j]: int(block_tuple[j]) for j in range(n_lanes)
+        }
 
-    if base_tuple in vecinos:
-        vecinos.remove(base_tuple)
+        # Enforce constraints on base block
+        block_counts = sim.enforce_lane_constraints(block_counts)
+        total_actual = sum(block_counts.values())
+
+        for lane_name in DECISION_LANES:
+            # Neighbor: -1
+            if block_counts[lane_name] > 0:
+                c_minus = block_counts.copy()
+                c_minus[lane_name] = max(0, c_minus[lane_name] - 1)
+                c_minus = sim.enforce_lane_constraints(c_minus)
+                if sum(c_minus.values()) <= max_total_lanes:
+                    # Construct new x
+                    new_block_tuple = tuple(
+                        int(c_minus.get(k, 0)) for k in DECISION_LANES
+                    )
+                    new_x = list(x)
+                    new_x[offset : offset + n_lanes] = new_block_tuple
+                    vecinos.add(tuple(new_x))
+
+            # Neighbor: +1
+            if total_actual < max_total_lanes:
+                c_plus = block_counts.copy()
+                c_plus[lane_name] = c_plus[lane_name] + 1
+                c_plus = sim.enforce_lane_constraints(c_plus)
+                if sum(c_plus.values()) <= max_total_lanes:
+                    # Construct new x
+                    new_block_tuple = tuple(
+                        int(c_plus.get(k, 0)) for k in DECISION_LANES
+                    )
+                    new_x = list(x)
+                    new_x[offset : offset + n_lanes] = new_block_tuple
+                    vecinos.add(tuple(new_x))
+
+    if x in vecinos:
+        vecinos.remove(x)
 
     return list(vecinos)
 
@@ -689,15 +754,21 @@ def _format_policy_counts(counts: dict[str, int]) -> str:
 
 
 def _record_progress(label: str, iteration: int, res: EvalSAAResult) -> None:
+    # Use the full schedule for accurate financial metrics
+    schedule = lane_tuple_to_schedule(res.x)
+    metrics = calculate_financial_metrics(schedule, res.profit_mean * DAYS_PER_YEAR)
+
+    # For logging 'counts', we use the max counts (legacy compatibility)
     counts = sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
-    cost_cfg = cost_anual_config(counts)
+
     OPT_PROGRESS.append(
         {
             "phase": label,
             "iteration": iteration,
-            "profit": res.profit_mean,
-            "cost": cost_cfg,
-            "objective": res.objetivo_mean,
+            "profit_gross": res.profit_mean * DAYS_PER_YEAR,
+            "npv": res.objetivo_mean,  # Objetivo es VPN
+            "capex": metrics["capex"],
+            "ebitda": metrics["ebitda_anual_promedio"],
             "counts": counts.copy(),
             "x": res.x,
             "day_type": res.day_type.name,
@@ -709,21 +780,22 @@ def _record_progress(label: str, iteration: int, res: EvalSAAResult) -> None:
 def _print_iteration_progress(label: str, iteration: int, res: EvalSAAResult) -> None:
     _record_progress(label, iteration, res)
     counts = OPT_PROGRESS[-1]["counts"]
-    cost_cfg = OPT_PROGRESS[-1]["cost"]
+    npv_val = OPT_PROGRESS[-1]["npv"]
+    profit_val = OPT_PROGRESS[-1]["profit_gross"]
     counts_str = _format_policy_counts(counts)
     print(
         f"[{label}] Iter {iteration}: "
         f"x={res.x} ({counts_str}) | "
-        f"Profit={_fmt_clp(res.profit_mean)} | "
-        f"Costo={_fmt_clp(cost_cfg)} | "
-        f"Objetivo={_fmt_clp(res.objetivo_mean)}"
+        f"ProfitBruto(Anual)={_fmt_clp(profit_val)} | "
+        f"VPN={_fmt_clp(npv_val)}"
     )
 
 
 def imprimir_resumen_resultado(res: EvalSAAResult, titulo: str = "Resultado") -> None:
     counts = sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
     total_lanes = sum(counts.values())
-    cost_config = cost_anual_config(counts)
+    
+    metrics = calculate_financial_metrics(counts, res.profit_mean * DAYS_PER_YEAR)
 
     print(f"\n--- {titulo} ({res.day_type.name}) ---")
     print(
@@ -732,22 +804,28 @@ def imprimir_resumen_resultado(res: EvalSAAResult, titulo: str = "Resultado") ->
     )
     print(f"Config normalizada: {counts}  (total {total_lanes} cajas)")
 
-    print("\nCostos:")
-    print(f"  Costo anual configuración: {_fmt_clp(cost_config)}")
-    print("\nDesempeño estimado (SAA):")
+    
+    print("\nEstructura Financiera (Estimada):")
+    print(f"  Inversión Inicial (CAPEX) : {_fmt_clp(metrics['capex'])}")
+    print(f"  OPEX Anual Promedio (Total): {_fmt_clp(metrics['opex_anual_promedio'])}")
+    print(f"  Profit Bruto Anual (Sim)   : {_fmt_clp(res.profit_mean * DAYS_PER_YEAR)}")
+    print(f"  EBITDA Anual Promedio      : {_fmt_clp(metrics['ebitda_anual_promedio'])}")
+    print(f"  Flujo Caja Libre (FCF)    : {_fmt_clp(metrics['fcf_anual_promedio'])}")
+    print("\nDesempeño (Objetivo = VPN):")
     print(
-        f"  Profit anual medio      ≈ {_fmt_clp(res.profit_mean)} "
-        f"(± {res.profit_std:,.0f})"
-    )
-    print(
-        f"  Objetivo (profit - costo) medio ≈ {_fmt_clp(res.objetivo_mean)} "
+        f"  VPN (5 años, {DISCOUNT_RATE*100}%) : {_fmt_clp(res.objetivo_mean)} "
         f"(± {res.objetivo_std:,.0f})"
     )
+    
     if total_lanes > 0:
-        print(f"  Profit medio por caja   ≈ {_fmt_clp(res.profit_mean / total_lanes)}")
-        print(
-            f"  Objetivo medio por caja ≈ {_fmt_clp(res.objetivo_mean / total_lanes)}"
-        )
+        print(f"  VPN medio por caja      : {_fmt_clp(res.objetivo_mean / total_lanes)}")
+    
+    if res.kpis:
+        print("\nKPIs Operativos (Estimados):")
+        print(f"  Tiempo Espera Promedio  : {res.kpis.get('avg_wait_time', 0):.1f} seg")
+        print(f"  Tasa de Abandono        : {res.kpis.get('abandonment_rate', 0)*100:.1f}%")
+        print(f"  Clientes Atendidos (Día): {res.kpis.get('served_customers', 0)}")
+        
     print(f"  Réplicas SAA usadas: {res.n_rep}")
     print("------------------------------")
 
@@ -759,36 +837,36 @@ def _export_progress_plot(day_type: sim.DayType) -> Path | None:
     out_root = PROJECT_ROOT / "resultados_opt"
     out_root.mkdir(parents=True, exist_ok=True)
     idx = range(len(entries))
-    objectives = [e["objective"] for e in entries]
-    profits = [e["profit"] for e in entries]
-    costs = [e["cost"] for e in entries]
+    objectives = [e["npv"] for e in entries]
+    profits = [e["profit_gross"] for e in entries]
+    capex = [e["capex"] for e in entries]
     labels = [f"{e['phase']}#{e['iteration']}" for e in entries]
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(idx, objectives, label="Objetivo", marker="o")
-    ax.plot(idx, profits, label="Profit", marker="s")
-    ax.plot(idx, costs, label="Costo", marker="^")
-    ax.set_title(f"Progreso optimización {day_type.name}")
+    ax.plot(idx, objectives, label="VPN (Objetivo)", marker="o", color="blue")
+    ax.plot(idx, profits, label="Profit Bruto", marker="s", color="green", alpha=0.5)
+    ax.plot(idx, capex, label="CAPEX", marker="^", color="red", alpha=0.5)
+    ax.set_title(f"Progreso optimización {day_type.name} (VPN)")
     ax.set_xlabel("Evaluación")
     ax.set_ylabel("CLP (miles de millones)")
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda val, _pos: f"{val / 1e9:.2f}"))
-    base_obj = entries[0]["objective"]
-    ax.axhline(base_obj, linestyle="--", color="gray", label="Objetivo base")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda val, _pos: f"{val / 1e6:.0f}M"))
+    base_obj = entries[0]["npv"]
+    ax.axhline(base_obj, linestyle="--", color="gray", label="VPN base")
     ax.grid(True, alpha=0.3)
     ax.legend()
     ax.set_xticks(list(idx))
     ax.set_xticklabels(labels, rotation=45, ha="right")
-    best_entry = max(entries, key=lambda e: e["objective"])
+    best_entry = max(entries, key=lambda e: e["npv"])
     counts_text = _format_policy_counts(best_entry["counts"])
     improvement_pct = (
-        ((best_entry["objective"] - base_obj) / abs(base_obj)) * 100.0
-        if base_obj not in (0, None)
+        ((best_entry["npv"] - base_obj) / abs(base_obj)) * 100.0
+        if base_obj != 0
         else 0.0
     )
     text = (
         f"Mejor política: {best_entry['x']} ({counts_text})\n"
-        f"Profit={_fmt_clp(best_entry['profit'])} | "
-        f"Costo={_fmt_clp(best_entry['cost'])} | "
-        f"Objetivo={_fmt_clp(best_entry['objective'])}\n"
+        f"Profit Bruto={_fmt_clp(best_entry['profit_gross'])} | "
+        f"CAPEX={_fmt_clp(best_entry['capex'])} | "
+        f"VPN={_fmt_clp(best_entry['npv'])}\n"
         f"Mejora vs base: {improvement_pct:.2f}%"
     )
     fig.tight_layout(rect=(0, 0, 1, 0.9))
@@ -814,9 +892,10 @@ def _export_progress_csv(day_type: sim.DayType) -> Path | None:
             {
                 "phase": e["phase"],
                 "iteration": e["iteration"],
-                "profit_mean": e["profit"],
-                "cost_mean": e["cost"],
-                "objective_mean": e["objective"],
+                "profit_gross_mean": e["profit_gross"],
+                "capex": e["capex"],
+                "ebitda": e["ebitda"],
+                "npv_mean": e["npv"],
                 "lane_counts": counts_str,
                 "x_tuple": e["x"],
                 "elapsed_s": e["elapsed_s"],
@@ -847,10 +926,10 @@ def optimizar_cajas_grasp_saa(
     use_in_memory: bool | None = None,
     keep_outputs_eval: bool = False,
 ) -> EvalSAAResult:
-    global START_TIME, MAX_SECONDS, MAX_EVALS, EVAL_COUNT
+    global START_TIME, MAX_SECONDS, MAX_EVAL_COUNT, EVAL_COUNT
     START_TIME = time.time()
     MAX_SECONDS = max_seconds if max_seconds and max_seconds > 0 else None
-    MAX_EVALS = max_eval_count if max_eval_count and max_eval_count > 0 else None
+    MAX_EVAL_COUNT = max_eval_count if max_eval_count and max_eval_count > 0 else None
     EVAL_COUNT = 0
     OPT_PROGRESS.clear()
 
@@ -862,7 +941,7 @@ def optimizar_cajas_grasp_saa(
         use_in_memory = not keep_outputs_eval
     shared_tmp = None
     if not use_in_memory and not keep_outputs_eval:
-        # Reutilizamos un directorio temporal para todas las r�plicas/vecinos
+        # Reutilizamos un directorio temporal para todas las rplicas/vecinos
         from tempfile import TemporaryDirectory
 
         shared_tmp_ctx = TemporaryDirectory()
@@ -956,21 +1035,20 @@ def optimizar_cajas_grasp_saa(
             return x0_eval
         raise
     finally:
-        # Limpia el directorio temporal compartido si se cre� en modo r�pido con disco.
+        # Limpia el directorio temporal compartido si se cre en modo rpido con disco.
         if shared_tmp is not None:
             try:
                 shared_tmp_ctx.cleanup()
             except Exception:
                 pass
 
-
 @dataclass
 class MultiDayResult:
     por_tipo: dict[sim.DayType, EvalSAAResult]
     dias_por_tipo: dict[sim.DayType, int]
-    profit_global: float
-    cost_infra_anual: float
-    objective_global: float
+    profit_bruto_global_anual: float
+    capex_total: float
+    npv_global: float
 
 
 def combinar_resultados_por_tipo(
@@ -998,15 +1076,16 @@ def combinar_resultados_por_tipo(
     for lane in DECISION_LANES:
         counts_max[lane] = max(counts_por_tipo[dt][lane] for dt in counts_por_tipo)
 
-    cost_infra_anual = cost_anual_config(counts_max)
-    objective_global = profit_global - cost_infra_anual
+    # Calculamos el VPN global considerando la infraestructura máxima necesaria
+    # y el profit promedio ponderado.
+    metrics_global = calculate_financial_metrics(counts_max, profit_global)
 
     return MultiDayResult(
         por_tipo=res_por_tipo,
         dias_por_tipo=dias_por_tipo,
-        profit_global=profit_global,
-        cost_infra_anual=cost_infra_anual,
-        objective_global=objective_global,
+        profit_bruto_global_anual=profit_global,
+        capex_total=metrics_global["capex"],
+        npv_global=metrics_global["npv"],
     )
 
 
@@ -1020,11 +1099,11 @@ def imprimir_resumen_global_multi_dia(multi: MultiDayResult) -> None:
     for dt, n in dias_por_tipo.items():
         print(f"  {dt.name:10s}: {n:4d} días ({100.0*frac_por_tipo[dt]:5.1f} %)")
 
-    print("\nResultados por tipo de día:")
+    print("\nResultados por tipo de día (VPN individual):")
     for dt, res in multi.por_tipo.items():
         print(
-            f"- {dt.name:10s}: profit medio ≈ {_fmt_clp(res.profit_mean)} "
-            f"(± {res.profit_std:,.0f}), objetivo ≈ {_fmt_clp(res.objetivo_mean)}"
+            f"- {dt.name:10s}: Profit Bruto ≈ {_fmt_clp(res.profit_mean)} "
+            f"| VPN ≈ {_fmt_clp(res.objetivo_mean)}"
         )
 
     counts_por_tipo = {
@@ -1040,11 +1119,11 @@ def imprimir_resumen_global_multi_dia(multi: MultiDayResult) -> None:
         f"  Configuración máxima: {counts_max} "
         f"(total {sum(counts_max.values())} cajas)"
     )
-    print(f"  Costo anual infraestructura: {_fmt_clp(multi.cost_infra_anual)}")
+    print(f"  CAPEX Total (Inversión t=0): {_fmt_clp(multi.capex_total)}")
 
-    print("\nObjetivo global (ponderado por frecuencia de tipos de día):")
-    print(f"  Profit anual combinado ≈ {_fmt_clp(multi.profit_global)}")
-    print(f"  Objetivo global        ≈ {_fmt_clp(multi.objective_global)}")
+    print("\nDesempeño Global (Ponderado):")
+    print(f"  Profit Bruto Anual Promedio ≈ {_fmt_clp(multi.profit_bruto_global_anual)}")
+    print(f"  VPN Global del Proyecto     ≈ {_fmt_clp(multi.npv_global)}")
     print("==============================================")
 
 

@@ -2,15 +2,16 @@
 """
 Reconstruye el modelo de tiempos de servicio a partir de los outputs teoricos.
 
-Pasos:
-1. Ajusta una regresion lineal con items y dummies para perfil, prioridad,
-   medio de pago, tipo de caja y tipo de dia.
-2. Calcula residuales y marca como outliers a los que superen un umbral absoluto
-   definido por un percentil configurable.
-3. Ajusta distribuciones para residuales inlier/outlier usando KS + AIC para
-   escoger la mejor alternativa disponible.
-4. Exporta un JSON con coeficientes y modelos de residuales para uso directo
-   dentro del simulador.
+ENFOQUE HIBRIDO:
+1. CAJAS REGULARES: Regresion Lineal Multivariada (Items + Priority + Payment).
+   - Rationale: Cajeros entrenados, varianza constante, efectos aditivos claros.
+   
+2. SELF-CHECKOUT (SCO) y EXPRESS: Modelo de Tasa Estocastica (Stochastic Rate).
+   - Rationale: Velocidad dictada por el cliente (SCO) o dominada por setup/pago variable (Express).
+   - Metodo:
+     a) Estimar Setup Time fijo (intercepto).
+     b) Calcular 'Segundos por Item' para cada transaccion: (Time - Setup) / Items.
+     c) Ajustar distribucion Lognormal a estos 'Segundos por Item'.
 """
 
 from __future__ import annotations
@@ -19,11 +20,12 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Tuple, Any
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from scipy import stats
 
 DAY_TYPE_BY_DAYNUM = {
@@ -36,7 +38,6 @@ DAY_TYPE_BY_DAYNUM = {
     7: "tipo_3",
 }
 
-CAT_COLS = ["profile", "priority", "payment_method", "lane_type", "day_type"]
 CANDIDATE_DISTS = ["norm", "t", "lognorm", "gamma"]
 POSITIVE_SUPPORT_DISTS = {"lognorm", "gamma"}
 LANE_NORMALIZATION = {"sco": "self_checkout", "self_checkout": "self_checkout"}
@@ -76,9 +77,9 @@ def load_dataset(root: Path) -> pd.DataFrame:
         if df.empty:
             continue
         df["day_type"] = day_type
-        df["profile"] = df["profile"].astype(str).str.strip().str.lower()
-        df["priority"] = df["priority"].astype(str).str.strip().str.lower()
-        df["payment_method"] = df["payment_method"].astype(str).str.strip().str.lower()
+        for col in ["profile", "priority", "payment_method"]:
+            df[col] = df[col].astype(str).str.strip().str.lower()
+            
         df["lane_type"] = (
             df["lane_type"]
             .astype(str)
@@ -91,45 +92,11 @@ def load_dataset(root: Path) -> pd.DataFrame:
         df = df[np.isfinite(df["items"]) & np.isfinite(df["service_time_s"])]
         if df.empty:
             continue
-        frames.append(df[CAT_COLS + ["items", "service_time_s"]])
+        frames.append(df)
+        
     if not frames:
         raise SystemExit("No se hallaron registros validos en outputs_teoricos")
     return pd.concat(frames, ignore_index=True)
-
-
-def build_design_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, dict]]:
-    cat_info: Dict[str, dict] = {}
-    X = pd.DataFrame({"items": df["items"].astype(float)})
-    for col in CAT_COLS:
-        cats = sorted(df[col].unique())
-        baseline = cats[0]
-        dummies = pd.get_dummies(df[col], prefix=col)
-        base_col = f"{col}_{baseline}"
-        if base_col in dummies:
-            dummies = dummies.drop(columns=base_col)
-        X = pd.concat([X, dummies], axis=1)
-        cat_info[col] = {"baseline": baseline, "levels": cats}
-    X = sm.add_constant(X)
-    X = X.astype(float)
-    return X, cat_info
-
-
-def build_coefficients(params: pd.Series, cat_info: dict) -> dict:
-    coeffs = {
-        "intercept": float(params.get("const", 0.0)),
-        "items": float(params.get("items", 0.0)),
-        "categories": {},
-    }
-    for col, info in cat_info.items():
-        entry = {"baseline": info["baseline"], "coeffs": {}}
-        for level in info["levels"]:
-            if level == info["baseline"]:
-                continue
-            col_name = f"{col}_{level}"
-            if col_name in params:
-                entry["coeffs"][level] = float(params[col_name])
-        coeffs["categories"][col] = entry
-    return coeffs
 
 
 def fit_best_distribution(data: np.ndarray) -> dict:
@@ -169,72 +136,139 @@ def fit_best_distribution(data: np.ndarray) -> dict:
     }
 
 
-def analyze_residuals(df: pd.DataFrame, residual_pct: float) -> tuple[dict, dict]:
-    models: dict[str, dict] = {}
-    all_inliers: list[float] = []
-    all_outliers: list[float] = []
-    thresholds: list[float] = []
-    total = 0
-    total_out = 0
-    grouped = df.groupby(["profile", "priority", "payment_method", "day_type", "lane_type"])
-    for combo, subset in grouped:
-        values = subset["residual"].to_numpy()
-        if len(values) < 20:
-            continue
-        abs_values = np.abs(values)
-        threshold = float(np.quantile(abs_values, residual_pct))
-        mask = abs_values > threshold
-        outliers = values[mask]
-        inliers = values[~mask]
-        all_inliers.extend(inliers.tolist())
-        all_outliers.extend(outliers.tolist())
-        total += len(values)
-        total_out += len(outliers)
-        thresholds.append(threshold)
-        entry = {
-            "prob_outlier": float(len(outliers) / len(values)) if len(values) else 0.0,
-            "abs_threshold": threshold,
-            "n_obs": int(len(values)),
-            "inlier": fit_best_distribution(inliers),
-            "outlier": fit_best_distribution(outliers) if len(outliers) >= 5 else None,
-        }
-        models["|".join(combo)] = entry
-    defaults = {
-        "prob_outlier": float(total_out / total) if total else 0.0,
-        "abs_threshold": float(np.median(thresholds)) if thresholds else 0.0,
-        "n_obs": int(total),
-        "inlier": fit_best_distribution(np.asarray(all_inliers)),
-        "outlier": fit_best_distribution(np.asarray(all_outliers)) if all_outliers else None,
+def analyze_residuals(residuals: np.ndarray, residual_pct: float) -> dict:
+    if len(residuals) < 20:
+        return None
+    abs_values = np.abs(residuals)
+    threshold = float(np.quantile(abs_values, residual_pct))
+    mask = abs_values > threshold
+    outliers = residuals[mask]
+    inliers = residuals[~mask]
+    return {
+        "prob_outlier": float(len(outliers) / len(residuals)) if len(residuals) else 0.0,
+        "abs_threshold": threshold,
+        "n_obs": int(len(residuals)),
+        "inlier": fit_best_distribution(inliers),
+        "outlier": fit_best_distribution(outliers) if len(outliers) >= 5 else None,
     }
-    return models, defaults
+
+
+def fit_stochastic_rate_model(subset: pd.DataFrame) -> dict:
+    """
+    Ajusta el modelo estocastico:
+    Time = Setup + Items * Rate
+    Rate ~ Lognormal
+    """
+    # 1. Estimar Setup Time (Intercepto robusto)
+    X = sm.add_constant(subset["items"])
+    pre_model = sm.OLS(subset["service_time_s"], X).fit()
+    setup_time = max(5.0, pre_model.params.get("const", 15.0)) 
+    
+    # 2. Calcular tasas observadas (Seconds per Item)
+    valid = subset[subset["items"] > 0].copy()
+    valid["implied_rate"] = (valid["service_time_s"] - setup_time) / valid["items"]
+    
+    # Filtramos tasas negativas o irreales
+    valid = valid[(valid["implied_rate"] > 0.1) & (valid["implied_rate"] < 120)]
+    
+    rates = valid["implied_rate"].values
+    
+    # 3. Ajustar Lognormal
+    shape, loc, scale = stats.lognorm.fit(rates, floc=0)
+    
+    mu_log = np.log(scale)
+    sigma_log = shape
+    
+    print(f"     [Stochastic] Setup={setup_time:.2f}s, Rate LogN(mu={mu_log:.2f}, sigma={sigma_log:.2f})")
+    print(f"     Media Tasa: {np.mean(rates):.2f} s/item, Mediana: {np.median(rates):.2f} s/item")
+    
+    return {
+        "model_method": "stochastic_rate",
+        "params": {
+            "setup_time": float(setup_time),
+            "rate_dist": {
+                "name": "lognorm",
+                "mu": float(mu_log),
+                "sigma": float(sigma_log)
+            }
+        },
+        "stats": {
+            "n_obs": int(len(rates)),
+            "mean_rate": float(np.mean(rates))
+        }
+    }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Recalibra el modelo de tiempos de servicio")
+    parser = argparse.ArgumentParser(description="Recalibra el modelo de tiempos de servicio Hibrido")
     parser.add_argument("--root", type=Path, default=Path("outputs_teoricos"))
-    parser.add_argument("--output", type=Path, default=Path("service_time/service_time_model.json"))
-    parser.add_argument("--residual-pct", type=float, default=0.99, help="Percentil absoluto para detectar outliers")
+    parser.add_argument("--output", type=Path, default=Path("data/service_time/service_time_model.json"))
+    parser.add_argument("--residual-pct", type=float, default=0.99)
     args = parser.parse_args()
 
+    print(f"Cargando datos desde {args.root}...")
     df = load_dataset(args.root)
-    X, cat_info = build_design_matrix(df)
-    model = sm.OLS(df["service_time_s"], X).fit()
-    coeffs = build_coefficients(model.params, cat_info)
-    df["prediction"] = model.predict(X)
-    df["residual"] = df["service_time_s"] - df["prediction"]
-    residual_models, defaults = analyze_residuals(df, args.residual_pct)
+    
+    models_by_lane = {}
+    lane_types = df["lane_type"].unique()
+    print(f"Tipos de caja encontrados: {lane_types}")
+    
+    for lane in lane_types:
+        print(f"Ajustando modelo para: {lane}...")
+        subset = df[df["lane_type"] == lane].copy()
+        
+        if len(subset) < 20:
+            print(f"  -> Saltando {lane} por falta de datos")
+            continue
+            
+        norm_lane = lane.lower().strip()
+        is_sco = norm_lane in ["self_checkout", "sco", "autocaja"]
+        is_express = "express" in norm_lane
+        
+        if is_sco or is_express:
+            # --- MODELO ESTOCASTICO PARA SCO Y EXPRESS ---
+            tipo = "SCO" if is_sco else "Express"
+            print(f"  -> Detectado {tipo}: Usando ajuste de Tasa Estocastica")
+            models_by_lane[lane] = fit_stochastic_rate_model(subset)
+            
+        else:
+            # --- MODELO REGRESION MULTIVARIADA PARA REGULARES ---
+            print("  -> Detectado Regular: Usando Regresion Multivariada")
+            formula = "service_time_s ~ items + C(priority) + C(payment_method)"
+            try:
+                model = smf.ols(formula=formula, data=subset).fit()
+            except Exception as e:
+                print(f"  -> Error: {e}")
+                continue
+                
+            coeffs = {name: float(val) for name, val in model.params.items()}
+            r2 = float(model.rsquared)
+            
+            subset["prediction"] = model.predict(subset)
+            subset["residual"] = subset["service_time_s"] - subset["prediction"]
+            residual_model = analyze_residuals(subset["residual"].values, args.residual_pct)
+            
+            models_by_lane[lane] = {
+                "model_method": "multivariate_regression",
+                "coeffs": coeffs,
+                "stats": {"r2": r2, "n_obs": int(len(subset))},
+                "residual_model": residual_model
+            }
+            print(f"     R2={r2:.4f}")
 
     payload = {
-        "coefficients": coeffs,
-        "residual_models": residual_models,
-        "defaults": defaults,
-        "r2": float(model.rsquared),
-        "n_obs": int(df.shape[0]),
+        "type": "hybrid_multivariate_stochastic",
+        "models": models_by_lane,
+        "meta": {
+            "source": str(args.root),
+            "description": "Hibrido: SCO/Express=StochasticRate, Otros=MultivariateRegression"
+        }
     }
+    
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
-    print(f"Modelo guardado en {args.output} (R2={model.rsquared:.4f}, N={df.shape[0]})")
+    print(f"Modelo guardado en {args.output}")
 
 
 if __name__ == "__main__":

@@ -168,8 +168,19 @@ def fit_arrival_kde():
     riats = np.array(riats)
     print(f"\nTotal Intervals: {len(riats)}")
     mean_riat = np.mean(riats)
-    print(f"Mean: {mean_riat:.4f} (Expected ~1.0 for Poisson)")
-    print(f"Var:  {np.var(riats):.4f} (Expected ~1.0 for Poisson)")
+    print(f"Mean (raw): {mean_riat:.4f} (Expected ~1.0 for Poisson)")
+    print(f"Var (raw):  {np.var(riats):.4f} (Expected ~1.0 for Poisson)")
+    
+    # CRITICAL FIX: Normalize RIATs to have mean = 1.0
+    # This ensures that the arrival rate is preserved when using the KDE
+    if abs(mean_riat - 1.0) > 0.01:
+        print(f"\n[INFO] Normalizing RIATs by dividing by mean={mean_riat:.4f}")
+        riats_normalized = riats / mean_riat
+        print(f"Mean (normalized): {np.mean(riats_normalized):.4f}")
+        print(f"Var (normalized):  {np.var(riats_normalized):.4f}")
+    else:
+        riats_normalized = riats
+        print("\n[INFO] RIATs already have mean ~1.0, no normalization needed")
     
     if abs(mean_riat - 1.0) > 0.5:
         print("\n[WARNING] The mean of Rescaled Inter-Arrival Times is far from 1.0!")
@@ -191,10 +202,10 @@ def fit_arrival_kde():
         n_jobs=-1  # Use all available cores
     )
     
-    # Downsample for fitting if too large
-    sample_data = riats
-    if len(riats) > 10000:
-        sample_data = np.random.choice(riats, 10000, replace=False)
+    # Downsample for fitting if too large - USE NORMALIZED DATA
+    sample_data = riats_normalized
+    if len(riats_normalized) > 10000:
+        sample_data = np.random.choice(riats_normalized, 10000, replace=False)
         
     grid.fit(sample_data.reshape(-1, 1))
     
@@ -214,8 +225,9 @@ def fit_arrival_kde():
         "kernel": str(best_kde.kernel),
         "bandwidth": float(best_kde.bandwidth),
         "metric": "euclidean",
-        "data_mean": float(np.mean(riats)),
-        "data_std": float(np.std(riats))
+        "data_mean": float(np.mean(riats_normalized)),  # Should be ~1.0 now
+        "data_std": float(np.std(riats_normalized)),
+        "original_mean": float(mean_riat),  # Save original for reference
     }
     
     # Also save a sample of the data (support) to allow reconstruction/sampling
@@ -247,13 +259,13 @@ def fit_arrival_kde():
     
     # Plot
     plt.figure(figsize=(10, 6))
-    plt.hist(riats, bins=100, density=True, alpha=0.5, label="Rescaled IATs")
-    x_plot = np.linspace(0, np.percentile(riats, 99), 1000)[:, np.newaxis]
+    plt.hist(riats_normalized, bins=100, density=True, alpha=0.5, label="Rescaled IATs (Normalized)")
+    x_plot = np.linspace(0, np.percentile(riats_normalized, 99), 1000)[:, np.newaxis]
     log_dens = best_kde.score_samples(x_plot)
     plt.plot(x_plot, np.exp(log_dens), label=f"KDE ({best_kde.kernel}, bw={best_kde.bandwidth:.2f})")
     
     # Compare with Exponential(1)
-    x_exp = np.linspace(0, np.percentile(riats, 99), 1000)
+    x_exp = np.linspace(0, np.percentile(riats_normalized, 99), 1000)
     plt.plot(x_exp, np.exp(-x_exp), 'r--', label="Exponential(1) (Poisson)")
     
     # Compare with Lognormal(mu=-sigma^2/2, sigma=1.3)
@@ -263,7 +275,7 @@ def fit_arrival_kde():
     plt.plot(x_exp, pdf_ln, 'g:', label=f"Current Lognormal (s={sigma})")
     
     plt.legend()
-    plt.title("Rescaled Inter-Arrival Times Distribution")
+    plt.title("Rescaled Inter-Arrival Times Distribution (Normalized)")
     plt.savefig("report_visualizations/arrival_kde_fit.png")
     print("Saved plot to report_visualizations/arrival_kde_fit.png")
 

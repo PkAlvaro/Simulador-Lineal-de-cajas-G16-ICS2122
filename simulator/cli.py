@@ -52,7 +52,9 @@ def _normalize_weeks_choice(weeks: int) -> int:
     return closest
 
 
-def _format_lane_tuple(counts: tuple[int, int, int, int]) -> str:
+def _format_lane_tuple(counts: tuple[int, ...]) -> str:
+    if len(counts) > 4:
+        return f"Schedule: {counts}"
     return ", ".join(f"{lane}={int(value)}" for lane, value in zip(LANE_ORDER, counts))
 
 
@@ -180,7 +182,39 @@ def run_optimizer() -> None:
     )
     keep_outputs = keep_outputs_resp in {"s", "si", "y", "yes"}
     use_in_memory = not keep_outputs
+    
+    use_sa_resp = (
+        input("¿Usar Simulated Annealing (SA) en búsqueda local? [n]: ")
+        .strip()
+        .lower()
+    )
+    use_sa = use_sa_resp in {"s", "si", "y", "yes"}
 
+    # --- 1. Evaluar Política Base (Benchmark) ---
+    print("\n[INFO] Evaluando política base (actual) para comparación...")
+    base_results = {}
+    
+    days_to_eval = [dt for dt in engine.DayType] if mode == "2" else [day]
+    
+    # Ejecutamos secuencialmente para evitar problemas de pickling con funciones locales en Windows
+    for d_type in days_to_eval:
+        try:
+            # Usamos 0 iteraciones para solo evaluar la política inicial sin optimizar
+            res_base = optimizar_cajas_grasp_saa(
+                day_type=d_type,
+                max_eval_count=1, 
+                context_label=f"BENCHMARK | Día={d_type.name}",
+                keep_outputs_eval=False,
+                use_in_memory=True,
+            )
+            base_results[res_base.day_type.name] = res_base
+        except Exception as e:
+            print(f"[WARN] Falló evaluación base para {d_type.name}: {e}")
+
+    print("[INFO] Evaluación base completada.\n")
+
+    # --- 2. Ejecutar Optimización ---
+    results = []
     if mode == "2":
         day_values = [dt.value for dt in engine.DayType]
         with ProcessPoolExecutor(max_workers=len(day_values)) as pool:
@@ -192,6 +226,7 @@ def run_optimizer() -> None:
                     max_evals,
                     keep_outputs,
                     use_in_memory,
+                    use_sa,
                 ): day_value
                 for day_value in day_values
             }
@@ -200,15 +235,11 @@ def run_optimizer() -> None:
                 try:
                     result = fut.result()
                     _print_optimizer_summary(result)
+                    results.append(result)
                 except Exception as exc:  # pragma: no cover
                     print(f"[ERROR] Optimización falló para {day_value}: {exc}")
     else:
-        mapping = {str(i + 1): dt for i, dt in enumerate(engine.DayType)}
-        print("Selecciona tipo de dia a optimizar:")
-        for key, dt in mapping.items():
-            print(f"  {key}) {dt.name} ({dt.value})")
-        choice = input("Opcion [1]: ").strip() or "1"
-        day = mapping.get(choice, engine.DayType.TYPE_1)
+        # ... (código existente para modo 1) ...
         result = optimizar_cajas_grasp_saa(
             day_type=day,
             max_seconds=max_seconds,
@@ -216,8 +247,115 @@ def run_optimizer() -> None:
             context_label=f"CLI | Día={day.name}",
             keep_outputs_eval=keep_outputs,
             use_in_memory=use_in_memory,
+            use_sa=use_sa,
         )
         _print_optimizer_summary(result)
+        results.append(result)
+
+    # --- 3. Mostrar Resumen Comparativo ---
+    if results:
+        print("\n" + "="*80)
+        print("RESUMEN CONSOLIDADO DE OPTIMIZACIÓN (vs BASE)")
+        print("="*80)
+        results.sort(key=lambda r: r.day_type.name)
+        
+        from simulator.optimizador_cajas import lane_tuple_to_schedule, calculate_financial_metrics, lane_tuple_to_dict
+        import simulator.engine as sim
+
+        for res in results:
+            d_name = res.day_type.name
+            base = base_results.get(d_name)
+            
+            # Métricas Optimizadas
+            sched_opt = lane_tuple_to_schedule(res.x)
+            met_opt = calculate_financial_metrics(sched_opt, res.profit_mean * 365)
+            vpn_opt = res.objetivo_mean
+            
+            # Métricas Base
+            if base:
+                sched_base = lane_tuple_to_schedule(base.x)
+                met_base = calculate_financial_metrics(sched_base, base.profit_mean * 365)
+                vpn_base = base.objetivo_mean
+                profit_base_anual = base.profit_mean * 365
+                
+                # Deltas
+                delta_vpn = vpn_opt - vpn_base
+                pct_vpn = (delta_vpn / abs(vpn_base)) * 100 if vpn_base != 0 else 0
+            else:
+                # Fallback si falló la base
+                met_base = {"capex": 0, "opex_anual_promedio": 0}
+                vpn_base = 0
+                profit_base_anual = 0
+                delta_vpn = 0
+                pct_vpn = 0
+
+            # Formateo
+            def fmt(x): return f"{x:,.0f}".replace(",", ".")
+            
+            print(f"\n>>> REPORTE EJECUTIVO: {d_name} <<<")
+            
+            # Función auxiliar para imprimir tabla de turnos
+            def print_schedule_table(title, x_tuple):
+                from simulator.optimizador_cajas import lane_tuple_to_dict, TIME_BLOCKS, DECISION_LANES
+                
+                # Decodificar la tupla a diccionario por bloques
+                # x_tuple tiene estructura plana: [Lanes_B1, Lanes_B2, Lanes_B3]
+                num_lanes = len(DECISION_LANES)
+                blocks_data = []
+                for i, (start, end) in enumerate(TIME_BLOCKS):
+                    block_slice = x_tuple[i*num_lanes : (i+1)*num_lanes]
+                    row = {lane: val for lane, val in zip(DECISION_LANES, block_slice)}
+                    row["Periodo"] = f"{start:02d}:00 - {end:02d}:00"
+                    blocks_data.append(row)
+                
+                # Calcular Infraestructura (Máximo requerido)
+                infra = {lane: 0 for lane in DECISION_LANES}
+                for lane in DECISION_LANES:
+                    infra[lane] = max(row[lane] for row in blocks_data)
+                
+                print(f"\n  {title}")
+                print(f"  {'-'*65}")
+                header = f"  {'Periodo':<18} | " + " | ".join(f"{l.capitalize():<9}" for l in DECISION_LANES)
+                print(header)
+                print(f"  {'-'*65}")
+                for row in blocks_data:
+                    vals = " | ".join(f"{int(row[l]):<9}" for l in DECISION_LANES)
+                    print(f"  {row['Periodo']:<18} | {vals}")
+                print(f"  {'-'*65}")
+                
+                infra_str = ", ".join(f"{l.capitalize()}: {infra[l]}" for l in DECISION_LANES)
+                total_cajas = sum(infra.values())
+                print(f"  [INFRAESTRUCTURA REQUERIDA] Total: {total_cajas} cajas ({infra_str})")
+
+            if base:
+                print_schedule_table("POLÍTICA BASE (ACTUAL)", base.x)
+            else:
+                print("  (Política Base no disponible)")
+                
+            print_schedule_table("POLÍTICA OPTIMIZADA (PROPUESTA)", res.x)
+            
+            print(f"\n  RESUMEN FINANCIERO (Anualizado)")
+            print(f"  {'-'*60}")
+            print(f"  {'Métrica':<15} | {'Base':>15} | {'Optimizado':>15} | {'Diferencia':>15}")
+            print(f"  {'-'*60}")
+            
+            metrics = [
+                ("Profit", profit_base_anual, res.profit_mean * 365),
+                ("OPEX", met_base['opex_anual_promedio'], met_opt['opex_anual_promedio']),
+                ("CAPEX (Inv)", met_base['capex'], met_opt['capex']),
+                ("VPN (Obj)", vpn_base, vpn_opt)
+            ]
+            
+            for name, val_b, val_o in metrics:
+                diff = val_o - val_b
+                print(f"  {name:<15} | {fmt(val_b):>15} | {fmt(val_o):>15} | {fmt(diff):>15}")
+            
+            print(f"  {'-'*60}")
+            signo = "+" if delta_vpn >= 0 else ""
+            print(f"  >>> MEJORA TOTAL VPN: {signo}{fmt(delta_vpn)} CLP ({signo}{pct_vpn:.1f}%)")
+            print("="*80)
+            
+        print("="*80 + "\n")
 
 
 def run_sequential_policy_plan() -> None:
@@ -390,6 +528,7 @@ def _optimizer_worker(
     max_evals: int | None,
     keep_outputs: bool,
     use_in_memory: bool,
+    use_sa: bool,
 ):
     import simulator.engine as engine
     from simulator.optimizador_cajas import optimizar_cajas_grasp_saa as worker_opt
@@ -402,18 +541,46 @@ def _optimizer_worker(
         context_label=f"CLI|POOL | Día={day.name}",
         keep_outputs_eval=keep_outputs,
         use_in_memory=use_in_memory,
+        use_sa=use_sa,
     )
 
 
 def _print_optimizer_summary(res):
     if not res:
         return
-    lane_names = ["regular", "express", "priority", "self_checkout"]
-    counts_str = ", ".join(f"{name}={value}" for name, value in zip(lane_names, res.x))
-    profit_fmt = f"{res.profit_mean:,.0f}".replace(",", ".")
+    if len(res.x) > 4:
+        counts_str = f"Schedule ({len(res.x)//4} blocks): {res.x}"
+    else:
+        lane_names = ["regular", "express", "priority", "self_checkout"]
+        counts_str = ", ".join(
+            f"{name}={value}" for name, value in zip(lane_names, res.x)
+        )
+    # Profit is already annualized in the optimizer result if using the new logic
+    # But let's be explicit if we can. 
+    # Assuming res.profit_mean is daily profit (as it comes from EvalSAAResult raw)
+    # Wait, in optimizador_cajas.py we updated it to return daily profit in profit_mean?
+    # No, we updated _record_progress and imprimir_resumen_resultado to multiply by 365.
+    # The EvalSAAResult struct still holds the raw simulation mean (daily).
+    # So we should multiply by 365 here for consistency.
+    
+    profit_fmt = f"{res.profit_mean * 365:,.0f}".replace(",", ".")
     objective_fmt = f"{res.objetivo_mean:,.0f}".replace(",", ".")
+    
+    # Calculate costs for display
+    from simulator.optimizador_cajas import lane_tuple_to_schedule, calculate_financial_metrics, lane_tuple_to_dict
+    import simulator.engine as sim
+    
+    schedule = lane_tuple_to_schedule(res.x)
+    counts = sim.enforce_lane_constraints(lane_tuple_to_dict(res.x))
+    # Recalculate metrics locally to get CAPEX/OPEX
+    metrics = calculate_financial_metrics(schedule, res.profit_mean * 365)
+    
+    capex_fmt = f"{metrics['capex']:,.0f}".replace(",", ".")
+    opex_fmt = f"{metrics['opex_anual_promedio']:,.0f}".replace(",", ".")
+    
     print(
-        f"[RESUMEN {res.day_type.name}] x={res.x} ({counts_str}) | Profit={profit_fmt} CLP | Objetivo={objective_fmt} CLP"
+        f"[RESUMEN {res.day_type.name}] {counts_str}\n"
+        f"  -> Profit(Anual)={profit_fmt} | OPEX(Anual)={opex_fmt} | CAPEX={capex_fmt} | VPN={objective_fmt} CLP"
     )
 
 
@@ -423,8 +590,8 @@ def show_menu() -> None:
 === SIMULADOR DE CAJAS ===
 1) Simular X semanas y generar KPIs
 2) Simular año completo (52 semanas)
-3) Ejecutar optimizador de cajas (GRASP+SAA)
-4) Planificación secuencial multi-año
+3) Optimizar Horarios (GRASP+SAA) vs Base
+4) Planificación Multi-Año (Evaluación de Robustez)
 5) Salir
 """
     )

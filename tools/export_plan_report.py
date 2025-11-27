@@ -24,7 +24,7 @@ from simulator.policy_planner import (  # noqa: E402
     SequentialOptimizationResult,
     plan_multi_year_optimization,
 )
-from simulator.optimizador_cajas import cost_anual_config, evaluate_policy_saa  # noqa: E402
+from simulator.optimizador_cajas import calculate_financial_metrics, evaluate_policy_saa  # noqa: E402
 
 
 def _parse_list(arg: str | None) -> list[str] | None:
@@ -73,7 +73,10 @@ def _add_detail_row(
     except Exception:
         return
     counts = _lane_tuple_to_counts(x_tuple)
-    infra_cost = float(cost_anual_config(counts))
+    # Usamos calculate_financial_metrics para obtener el CAPEX
+    # Asumimos profit_mean = 0 solo para obtener el CAPEX
+    metrics = calculate_financial_metrics(counts, 0.0)
+    infra_cost = float(metrics["capex"])
     profit_mean = float(getattr(result, "profit_mean", 0.0))
     profit_std = float(getattr(result, "profit_std", 0.0))
     objetivo_mean = float(

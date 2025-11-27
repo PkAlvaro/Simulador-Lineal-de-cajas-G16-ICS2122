@@ -24,8 +24,13 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _ANNOUNCED_FILES: set[Path] = set()
 _DEMAND_SCALING_FACTOR: float = 1.0
-# Sigma para la distribución Lognormal de llegadas (ajustado a datos teóricos ~1.0-1.4)
-ARRIVAL_LOGNORMAL_SIGMA: float = 1.3
+
+# Parametros para la distribucion Gamma de tiempos inter-arrival rescalados (RIATs)
+# Basado en analisis estadistico de datos teoricos (ver tools/compare_arrival_distributions.py)
+# Gamma(a=1.303, scale=0.815) tiene el mejor ajuste segun AIC y KS test
+ARRIVAL_GAMMA_SHAPE: float = 1.303241  # parametro 'a' (shape)
+ARRIVAL_GAMMA_SCALE: float = 0.815332  # parametro 'scale'
+# Media teorica: E[X] = shape * scale = 1.303 * 0.815 = 1.062 (coincide con datos)
 
 # === CONTROL DE SEMILLAS ALEATORIAS (Reproducibilidad) ===
 # Semilla maestra para reproducibilidad completa
@@ -345,6 +350,26 @@ def update_current_lane_policy(counts: dict[str, int]) -> dict[str, int]:
     return normalized
 
 
+def get_current_lane_policy() -> dict[str, int]:
+    """Retorna la configuración actual de cajas como dict simple {lane_name: count}."""
+    # Tomamos la configuración del TYPE_1 como referencia (o la máxima entre todos los tipos)
+    result = {
+        "regular": 0,
+        "express": 0,
+        "priority": 0,
+        "self_checkout": 0,
+    }
+    
+    for day_type, lane_counts in CURRENT_LANE_POLICY.items():
+        for lane_type, count in lane_counts.items():
+            lane_name = lane_type.value if hasattr(lane_type, 'value') else str(lane_type)
+            if lane_name == "sco":
+                lane_name = "self_checkout"
+            result[lane_name] = max(result.get(lane_name, 0), count)
+    
+    return result
+
+
 CURRENT_LANE_POLICY: dict[DayType, dict[LaneType, int]] = build_uniform_policy(
     DEFAULT_LANE_COUNTS[DayType.TYPE_1]
 )
@@ -394,29 +419,35 @@ def _normalize_lane_type_name(name: str) -> Optional[LaneType]:
     return None
 
 
+LANE_COSTS_FILE = PROJECT_ROOT / "data/proyeccion_costos_variables.csv"
+
 def _load_lane_cost_specs(path: Path = LANE_COSTS_FILE) -> dict[LaneType, LaneCostSpec]:
     path = Path(path)
     if not path.exists():
-        _warn("No se encontro costos_cajas.csv; se asumira costo cero", path)
+        _warn(f"No se encontro {path.name}; se asumira costo cero", path)
         return {}
     specs: dict[LaneType, LaneCostSpec] = {}
     try:
         with path.open(newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
+                # Solo cargamos el año base 2025 para la simulación simple
+                if row.get("year") != "2025":
+                    continue
+                    
                 lt = _normalize_lane_type_name(row.get("lane_type"))
                 if lt is None:
                     continue
                 try:
                     capex = float(row.get("capex_clp", 0))
-                    maintenance = float(row.get("maintenance_clp_per_year", 0))
-                    opex = float(row.get("opex_clp_per_hour", 0))
-                    wage_total = float(
-                        row.get("wage_total_clp_per_hour")
-                        or row.get("wage_clp_per_hour")
-                        or 0
-                    )
-                    useful_life = float(row.get("useful_life_years", 1))
+                    maintenance = float(row.get("maintenance_yearly_clp", 0))
+                    opex = float(row.get("opex_hourly_clp", 0))
+                    wage = float(row.get("wage_hourly_clp", 0))
+                    # En el nuevo CSV, wage es hourly. Sumamos opex + wage para tener el costo total por hora
+                    # wage_total_clp_per_hour en LaneCostSpec es la suma de ambos si no se especifica distinto
+                    wage_total = wage
+                    
+                    useful_life = 10.0 # Valor por defecto razonable si no está en el CSV nuevo
                 except (TypeError, ValueError):
                     continue
                 specs[lt] = LaneCostSpec(
@@ -427,8 +458,8 @@ def _load_lane_cost_specs(path: Path = LANE_COSTS_FILE) -> dict[LaneType, LaneCo
                     wage_total_clp_per_hour=wage_total,
                     useful_life_years=useful_life,
                 )
-    except Exception as exc:
-        _warn(f"No se pudieron leer costos de cajas ({exc})", path)
+    except Exception as e:
+        _warn(f"Error leyendo costos de cajas: {e}")
         return {}
     if specs:
         _announce_once("Cargando costos de infraestructura desde CSV", path)
@@ -766,29 +797,14 @@ def _build_kde_model(
     return model
 
 
-ARRIVAL_KDE_PARAMS_FILE = PROJECT_ROOT / "data/arrival_kde_params.json"
-ARRIVAL_KDE_MODEL = None
+# ARRIVAL_KDE_PARAMS_FILE = PROJECT_ROOT / "data/arrival_kde_params.json"
+# ARRIVAL_KDE_MODEL = None
 
-def _load_arrival_kde():
-    global ARRIVAL_KDE_MODEL
-    if not ARRIVAL_KDE_PARAMS_FILE.exists():
-        return
-    try:
-        with open(ARRIVAL_KDE_PARAMS_FILE, "r") as f:
-            params = json.load(f)
-        
-        support = np.array(params.get("support", []))
-        probs = np.array(params.get("probs", []))
-        kernel = params.get("kernel", "gaussian")
-        bandwidth = params.get("bandwidth", 1.0)
-        
-        if len(support) > 0 and len(probs) > 0:
-             ARRIVAL_KDE_MODEL = _build_kde_model(support, probs, kernel, bandwidth)
-             _announce_once("Cargado modelo KDE para llegadas", ARRIVAL_KDE_PARAMS_FILE)
-    except Exception as e:
-        _warn(f"Error cargando KDE de llegadas: {e}")
+# def _load_arrival_kde():
+#     """DEPRECATED: Ya no usamos KDE para llegadas, usamos Gamma directamente."""
+#     pass
 
-_load_arrival_kde()
+# _load_arrival_kde()  # No-op, mantenido por compatibilidad
 
 
 def _row_to_item_spec(row: Dict[str, Any]) -> ItemDistributionSpec:
@@ -1479,10 +1495,52 @@ class CheckoutLane:
         self.lane_id = lane_id
         self.lane_type = lane_type
         self.capacity = max(1, int(capacity))
+        self.max_capacity = self.capacity
+        self.is_open = True
+        self.dummy_users = []
+
         if lane_type is LaneType.PRIORITY:
             self.servidor = simpy.PriorityResource(env, capacity=1)
         else:
             self.servidor = simpy.Resource(env, capacity=self.capacity)
+
+    def set_active_capacity(self, n: int):
+        """
+        Ajusta la capacidad activa (solo para SCO/Pool).
+        Usa procesos dummy para bloquear slots si n < max_capacity.
+        """
+        if self.lane_type != LaneType.SCO:
+            return
+
+        target = max(0, min(n, self.max_capacity))
+        current_blocked = len(self.dummy_users)
+        needed_blocked = self.max_capacity - target
+
+        if needed_blocked > current_blocked:
+            # Bloquear mas
+            to_add = needed_blocked - current_blocked
+            for _ in range(to_add):
+                p = self.env.process(self._dummy_blocker())
+                self.dummy_users.append(p)
+        elif needed_blocked < current_blocked:
+            # Liberar
+            to_remove = current_blocked - needed_blocked
+            for _ in range(to_remove):
+                p = self.dummy_users.pop()
+                if p.is_alive:
+                    p.interrupt()
+
+    def _dummy_blocker(self):
+        try:
+            # Priority request con baja prioridad para no bloquear clientes reales si hay cola?
+            # No, queremos ocupar el recurso fisicamente.
+            # Si usamos PriorityResource para SCO, seria relevante.
+            # Pero SCO usa Resource normal.
+            with self.servidor.request() as req:
+                yield req
+                yield self.env.event()  # Esperar indefinidamente
+        except simpy.Interrupt:
+            pass  # Liberado
 
 
 def elegible(cliente, lane: CheckoutLane) -> bool:
@@ -1655,6 +1713,33 @@ class ServiceTimeFactorModel:
         "day_type": _norm_day_type,
     }
 
+class ServiceTimeFactorModel:
+    CATEGORY_NORMALIZERS = {
+        "profile": _norm_profile,
+        "priority": _norm_priority,
+        "payment_method": _norm_payment,
+        "lane_type": _norm_lane,
+        "day_type": _norm_day_type,
+    }
+
+class ServiceTimeFactorModel:
+    CATEGORY_NORMALIZERS = {
+        "profile": _norm_profile,
+        "priority": _norm_priority,
+        "payment_method": _norm_payment,
+        "lane_type": _norm_lane,
+        "day_type": _norm_day_type,
+    }
+
+class ServiceTimeFactorModel:
+    CATEGORY_NORMALIZERS = {
+        "profile": _norm_profile,
+        "priority": _norm_priority,
+        "payment_method": _norm_payment,
+        "lane_type": _norm_lane,
+        "day_type": _norm_day_type,
+    }
+
     def __init__(
         self,
         model_path: Path,
@@ -1663,22 +1748,92 @@ class ServiceTimeFactorModel:
     ):
         with open(model_path, encoding="utf-8") as fh:
             data = json.load(fh)
-        coeffs = data.get("coefficients", {})
-        self.intercept = float(coeffs.get("intercept", 0.0))
-        self.items_coef = float(coeffs.get("items", 0.0))
-        self.categories: dict[str, dict] = {}
-        for col, entry in coeffs.get("categories", {}).items():
-            baseline = str(entry.get("baseline", "")).strip().lower()
-            coeff_map = {
-                str(k).strip().lower(): float(v)
-                for k, v in entry.get("coeffs", {}).items()
-            }
-            self.categories[col] = {"baseline": baseline, "coeffs": coeff_map}
-        self.residual_models: dict[tuple[str, ...], _ServiceTimeResidualBucket] = {}
-        for key, entry in data.get("residual_models", {}).items():
-            combo = tuple(part.strip().lower() for part in key.split("|"))
-            self.residual_models[combo] = self._build_bucket(entry)
-        self.defaults = self._build_bucket(data.get("defaults"))
+        
+        self.model_type = data.get("type", "legacy")
+        self.lane_models = {}
+        
+        if self.model_type == "hybrid_multivariate_stochastic":
+            # Nuevo formato Hibrido
+            for lane, model_data in data.get("models", {}).items():
+                norm_lane = _norm_lane(lane)
+                method = model_data.get("model_method", "multivariate_regression")
+                
+                if method == "stochastic_rate":
+                    # Modelo SCO
+                    params = model_data.get("params", {})
+                    rate_dist = params.get("rate_dist", {})
+                    self.lane_models[norm_lane] = {
+                        "method": "stochastic_rate",
+                        "setup_time": float(params.get("setup_time", 15.0)),
+                        "rate_mu": float(rate_dist.get("mu", 0.0)),
+                        "rate_sigma": float(rate_dist.get("sigma", 1.0))
+                    }
+                else:
+                    # Modelo Regular
+                    self.lane_models[norm_lane] = {
+                        "method": "multivariate_regression",
+                        "coeffs": model_data.get("coeffs", {}),
+                        "residual_bucket": self._build_bucket(model_data.get("residual_model"))
+                    }
+            
+            # Fallback legacy vacio
+            self.intercept = 0.0
+            self.items_coef = 0.0
+            self.categories = {}
+            self.residual_models = {}
+            self.defaults = self._build_bucket(None)
+
+        elif self.model_type == "segmented_multivariate":
+            # ... (codigo anterior para segmented_multivariate) ...
+            for lane, model_data in data.get("models", {}).items():
+                norm_lane = _norm_lane(lane)
+                self.lane_models[norm_lane] = {
+                    "method": "multivariate_regression",
+                    "coeffs": model_data.get("coeffs", {}),
+                    "residual_bucket": self._build_bucket(model_data.get("residual_model"))
+                }
+            self.intercept = 0.0
+            self.items_coef = 0.0
+            self.categories = {}
+            self.residual_models = {}
+            self.defaults = self._build_bucket(None)
+
+        elif self.model_type == "segmented_by_lane":
+            # ... (codigo anterior para segmented_by_lane) ...
+            for lane, model_data in data.get("models", {}).items():
+                norm_lane = _norm_lane(lane)
+                coeffs = model_data.get("coeffs", {})
+                self.lane_models[norm_lane] = {
+                    "method": "simple_regression",
+                    "intercept": float(coeffs.get("intercept", 0.0)),
+                    "slope": float(coeffs.get("slope", 0.0)),
+                    "residual_bucket": self._build_bucket(model_data.get("residual_model"))
+                }
+            self.intercept = 0.0
+            self.items_coef = 0.0
+            self.categories = {}
+            self.residual_models = {}
+            self.defaults = self._build_bucket(None)
+            
+        else:
+            # Formato Legacy (Global con dummies)
+            coeffs = data.get("coefficients", {})
+            self.intercept = float(coeffs.get("intercept", 0.0))
+            self.items_coef = float(coeffs.get("items", 0.0))
+            self.categories: dict[str, dict] = {}
+            for col, entry in coeffs.get("categories", {}).items():
+                baseline = str(entry.get("baseline", "")).strip().lower()
+                coeff_map = {
+                    str(k).strip().lower(): float(v)
+                    for k, v in entry.get("coeffs", {}).items()
+                }
+                self.categories[col] = {"baseline": baseline, "coeffs": coeff_map}
+            self.residual_models: dict[tuple[str, ...], _ServiceTimeResidualBucket] = {}
+            for key, entry in data.get("residual_models", {}).items():
+                combo = tuple(part.strip().lower() for part in key.split("|"))
+                self.residual_models[combo] = self._build_bucket(entry)
+            self.defaults = self._build_bucket(data.get("defaults"))
+
         # Usar semilla derivada de la maestra si no se especifica
         seed = rng_seed if rng_seed is not None else (_MASTER_SEED + 3)
         self.rng = np.random.default_rng(seed)
@@ -1726,6 +1881,15 @@ class ServiceTimeFactorModel:
     def _lookup_bucket(
         self, profile, priority, payment_method, day_type, lane_type
     ) -> _ServiceTimeResidualBucket:
+        if self.model_type in ["hybrid_multivariate_stochastic", "segmented_multivariate", "segmented_by_lane"]:
+            norm_lane = _norm_lane(lane_type)
+            if norm_lane in self.lane_models:
+                # Si es stochastic_rate, no usamos bucket aditivo (devuelve dummy 0)
+                if self.lane_models[norm_lane].get("method") == "stochastic_rate":
+                    return self.defaults 
+                return self.lane_models[norm_lane].get("residual_bucket", self.defaults)
+            return self.defaults
+            
         key = self._combo_key(profile, priority, payment_method, day_type, lane_type)
         return self.residual_models.get(key, self.defaults)
 
@@ -1742,6 +1906,43 @@ class ServiceTimeFactorModel:
     def _base_prediction(
         self, profile, priority, payment_method, day_type, lane_type, items: float
     ) -> float:
+        if self.model_type in ["hybrid_multivariate_stochastic", "segmented_multivariate"]:
+            norm_lane = _norm_lane(lane_type)
+            model = self.lane_models.get(norm_lane)
+            
+            if not model:
+                return float(15.0 + 3.0 * items) # Fallback
+            
+            if model["method"] == "stochastic_rate":
+                # Para expected value de SCO: Setup + Items * E[Rate]
+                # E[Lognorm] = exp(mu + sigma^2 / 2)
+                mu = model["rate_mu"]
+                sigma = model["rate_sigma"]
+                avg_rate = np.exp(mu + (sigma**2)/2.0)
+                return float(model["setup_time"] + items * avg_rate)
+            
+            # Multivariate Regression
+            coeffs = model["coeffs"]
+            val = coeffs.get("Intercept", 0.0)
+            val += coeffs.get("items", 0.0) * float(max(0.0, items))
+            
+            norm_prio = _norm_priority(priority)
+            prio_key = f"C(priority)[T.{norm_prio}]"
+            val += coeffs.get(prio_key, 0.0)
+            
+            norm_pay = _norm_payment(payment_method)
+            pay_key = f"C(payment_method)[T.{norm_pay}]"
+            val += coeffs.get(pay_key, 0.0)
+            
+            return float(max(0.0, val))
+
+        if self.model_type == "segmented_by_lane":
+            norm_lane = _norm_lane(lane_type)
+            model = self.lane_models.get(norm_lane)
+            if model:
+                return float(model["intercept"] + model["slope"] * float(max(0.0, items)))
+            return float(15.0 + 3.0 * items)
+
         total = self.intercept + self.items_coef * float(max(0.0, items))
         if not self.categories:
             return float(max(0.0, total))
@@ -1765,36 +1966,22 @@ class ServiceTimeFactorModel:
         prof = _norm_profile(profile)
         return float(self.multipliers.get((lane, prof), 1.0))
 
-    def _stochastic_sco_time(
-        self, items: float, rng: Optional[np.random.Generator] = None
-    ) -> float:
-        """
-        Modelo de Tasa Estocástica para Self-Checkout.
-        Asume que cada cliente tiene una velocidad de escaneo propia.
-        Time = Setup + Items * (1 / Speed)
-        """
-        gen = rng or self.rng
-        
-        # Parámetros estimados para SCO (se podrían externalizar a config)
-        # Setup: tiempo de llegar, tocar pantalla, pagar.
-        setup_time = max(5.0, gen.normal(15.0, 5.0)) 
-        
-        # Tiempo por ítem: Lognormal para capturar la "cola larga" de usuarios lentos
-        # Mu=1.5, Sigma=0.6 -> Media aprox 6-7 seg/item, pero con alta varianza
-        sec_per_item = gen.lognormal(mean=1.5, sigma=0.6)
-        
-        # Límite físico: nadie tarda menos de 0.5s ni más de 60s por ítem promedio
-        sec_per_item = max(0.5, min(sec_per_item, 60.0))
-        
-        return float(setup_time + items * sec_per_item)
-
     def expected_value(
         self, *, profile, priority, payment_method, day_type, lane_type, items: float
     ) -> float:
-        # Para SCO, usamos la media teórica del modelo estocástico
+        if self.model_type in ["hybrid_multivariate_stochastic", "segmented_multivariate", "segmented_by_lane"]:
+             base = self._base_prediction(
+                profile, priority, payment_method, day_type, lane_type, items
+            )
+             bucket = self._lookup_bucket(
+                profile, priority, payment_method, day_type, lane_type
+            )
+             # Para stochastic_rate, bucket es dummy (0), asi que base es el valor esperado correcto
+             value = float(max(0.0, base + bucket.mean()))
+             return value * self._multiplier_for(lane_type, profile)
+
+        # Legacy logic para SCO
         if _norm_lane(lane_type) == "self_checkout":
-            # Media lognormal = exp(mu + sigma^2/2)
-            # mu=1.5, sigma=0.6 -> 1.5 + 0.18 = 1.68 -> exp(1.68) ~= 5.36 seg/item
             avg_setup = 15.0
             avg_per_item = np.exp(1.5 + (0.6**2)/2)
             base_val = avg_setup + items * avg_per_item
@@ -1820,12 +2007,43 @@ class ServiceTimeFactorModel:
         items: float,
         rng: Optional[np.random.Generator] = None,
     ) -> float:
-        # Lógica especial para Self-Checkout (baja correlación, alta varianza por usuario)
-        if _norm_lane(lane_type) == "self_checkout":
-            val = self._stochastic_sco_time(items, rng)
-            return val * self._multiplier_for(lane_type, profile)
-
         generator = rng or self.rng
+        
+        if self.model_type in ["hybrid_multivariate_stochastic", "segmented_multivariate", "segmented_by_lane"]:
+             norm_lane = _norm_lane(lane_type)
+             model = self.lane_models.get(norm_lane)
+             
+             # Caso especial: Stochastic Rate Sampling
+             if model and model.get("method") == "stochastic_rate":
+                 setup = model["setup_time"]
+                 mu = model["rate_mu"]
+                 sigma = model["rate_sigma"]
+                 # Sample rate from lognormal
+                 rate = generator.lognormal(mu, sigma)
+                 # Limites fisicos razonables (0.1s a 120s por item)
+                 rate = max(0.1, min(rate, 120.0))
+                 
+                 val = setup + items * rate
+                 return float(val * self._multiplier_for(lane_type, profile))
+             
+             # Caso Regular: Regresion + Residual Sampling (incluye outliers)
+             base = self._base_prediction(
+                profile, priority, payment_method, day_type, lane_type, items
+            )
+             bucket = self._lookup_bucket(
+                profile, priority, payment_method, day_type, lane_type
+            )
+             value = float(max(0.0, base + bucket.sample(generator)))
+             return value * self._multiplier_for(lane_type, profile)
+
+        # Legacy logic para SCO
+        if _norm_lane(lane_type) == "self_checkout":
+             setup_time = max(5.0, generator.normal(15.0, 5.0)) 
+             sec_per_item = generator.lognormal(mean=1.5, sigma=0.6)
+             sec_per_item = max(0.5, min(sec_per_item, 60.0))
+             val = float(setup_time + items * sec_per_item)
+             return val * self._multiplier_for(lane_type, profile)
+
         base = self._base_prediction(
             profile, priority, payment_method, day_type, lane_type, items
         )
@@ -2247,7 +2465,11 @@ def spawn_customer(
         return lt.value if hasattr(lt, "value") else lt
 
     # 1) filtrar cajas elegibles
-    eligibles = [lane for lane in lanes if elegible(cliente, lane)]
+    eligibles = [
+        lane
+        for lane in lanes
+        if elegible(cliente, lane) and getattr(lane, "is_open", True)
+    ]
     if not eligibles:
         reason = "no_eligible_lane"
         time_log.append(
@@ -2702,6 +2924,84 @@ def _build_lambda_matrix(combos: list[tuple], day_len: int) -> np.ndarray:
     return matriz
 
 
+def _apply_lane_config_dynamic(lanes: list[CheckoutLane], counts: dict[str, int]):
+    # counts: {lane_type_str: target_count}
+
+    # Group lanes by type
+    lanes_by_type = {}
+    for lane in lanes:
+        lt = lane.lane_type
+        # Normalize lane type string
+        if lt == LaneType.SCO:
+            lt_key = "self_checkout"
+        else:
+            lt_key = lt.value if hasattr(lt, "value") else str(lt)
+
+        if lt_key not in lanes_by_type:
+            lanes_by_type[lt_key] = []
+        lanes_by_type[lt_key].append(lane)
+
+    for lt_key, target_count in counts.items():
+        if lt_key not in lanes_by_type:
+            continue
+
+        available_lanes = lanes_by_type[lt_key]
+
+        # Special handling for SCO (Pooled)
+        if lt_key == "self_checkout":
+            # Assuming SCO is a single lane object with capacity
+            sco_lane = available_lanes[0]
+            sco_lane.set_active_capacity(target_count)
+
+        else:
+            # Regular/Express/Priority
+            # Sort lanes to have a deterministic order of opening/closing
+            available_lanes.sort(key=lambda x: x.lane_id)
+
+            for i, lane in enumerate(available_lanes):
+                if i < target_count:
+                    lane.is_open = True
+                else:
+                    lane.is_open = False
+
+
+def _lane_scheduler(
+    env, lanes: list[CheckoutLane], schedule: list[tuple[int, int, dict[str, int]]]
+):
+    """
+    Process to update lane availability based on schedule.
+    schedule: list of (start_hour, end_hour, counts_dict)
+    """
+    # Sort schedule by start time
+    schedule = sorted(schedule, key=lambda x: x[0])
+
+    current_idx = 0
+    while current_idx < len(schedule):
+        start_h, end_h, counts = schedule[current_idx]
+
+        # Calculate simulation time for start of this block
+        # Simulation starts at OPEN_S (8:00 AM usually).
+        # start_h is absolute hour (e.g., 8, 9, 13).
+
+        start_s = start_h * 3600
+        end_s = end_h * 3600
+
+        # Wait until start_s
+        now = env.now + OPEN_S  # env.now is relative to OPEN_S
+        if now < start_s:
+            yield env.timeout(start_s - now)
+
+        # Apply configuration
+        _apply_lane_config_dynamic(lanes, counts)
+
+        # Wait until end_s
+        now = env.now + OPEN_S
+        if now < end_s:
+            yield env.timeout(end_s - now)
+
+        current_idx += 1
+
+
 def _simular_dia_periodo(
     week_idx: int,
     dia_config: tuple[int, DayType, str],
@@ -2737,30 +3037,75 @@ def _simular_dia_periodo(
     if not policy:
         policy = CURRENT_LANE_POLICY.get(DayType.TYPE_1, {})
 
-    total_lanes = sum(
-        int(policy.get(lt, 0))
-        for lt in (LaneType.REGULAR, LaneType.EXPRESS, LaneType.PRIORITY, LaneType.SCO)
-    )
-    if total_lanes <= 0:
-        fallback_counts = DEFAULT_LANE_COUNTS.get(
-            day_type, DEFAULT_LANE_COUNTS.get(DayType.TYPE_1, {})
-        )
-        policy = {
-            LaneType.REGULAR: int(fallback_counts.get("regular", 0)),
-            LaneType.EXPRESS: int(fallback_counts.get("express", 0)),
-            LaneType.PRIORITY: int(fallback_counts.get("priority", 0)),
-            LaneType.SCO: int(fallback_counts.get("self_checkout", 0)),
-        }
+    # Check if policy is a schedule (list of tuples)
+    is_schedule = isinstance(policy, list)
 
-    for lane_type in (
-        LaneType.REGULAR,
-        LaneType.EXPRESS,
-        LaneType.PRIORITY,
-        LaneType.SCO,
-    ):
-        count = int(policy.get(lane_type, 0)) if policy else 0
-        prefix = LANE_PREFIXES.get(lane_type, lane_type.value.upper())
-        add(prefix, lane_type, count)
+    if is_schedule:
+        # Determine max lanes needed per type
+        max_counts = {
+            "regular": 0,
+            "express": 0,
+            "priority": 0,
+            "self_checkout": 0,
+        }
+        for _, _, counts in policy:
+            for k, v in counts.items():
+                norm_k = k.lower().strip()
+                if norm_k == "sco":
+                    norm_k = "self_checkout"
+                max_counts[norm_k] = max(max_counts.get(norm_k, 0), v)
+
+        # Initialize lanes with max capacity
+        for lane_type in (
+            LaneType.REGULAR,
+            LaneType.EXPRESS,
+            LaneType.PRIORITY,
+            LaneType.SCO,
+        ):
+            lt_key = (
+                lane_type.value if hasattr(lane_type, "value") else str(lane_type)
+            )
+            if lt_key == "sco":
+                lt_key = "self_checkout"
+
+            count = max_counts.get(lt_key, 0)
+            prefix = LANE_PREFIXES.get(lane_type, lane_type.value.upper())
+            add(prefix, lane_type, count)
+
+        # Start scheduler
+        env.process(_lane_scheduler(env, lanes, policy))
+
+    else:
+        # Legacy static policy
+        total_lanes = sum(
+            int(policy.get(lt, 0))
+            for lt in (
+                LaneType.REGULAR,
+                LaneType.EXPRESS,
+                LaneType.PRIORITY,
+                LaneType.SCO,
+            )
+        )
+        if total_lanes <= 0:
+            fallback_counts = DEFAULT_LANE_COUNTS.get(
+                day_type, DEFAULT_LANE_COUNTS.get(DayType.TYPE_1, {})
+            )
+            policy = {
+                LaneType.REGULAR: int(fallback_counts.get("regular", 0)),
+                LaneType.EXPRESS: int(fallback_counts.get("express", 0)),
+                LaneType.PRIORITY: int(fallback_counts.get("priority", 0)),
+                LaneType.SCO: int(fallback_counts.get("self_checkout", 0)),
+            }
+
+        for lane_type in (
+            LaneType.REGULAR,
+            LaneType.EXPRESS,
+            LaneType.PRIORITY,
+            LaneType.SCO,
+        ):
+            count = int(policy.get(lane_type, 0)) if policy else 0
+            prefix = LANE_PREFIXES.get(lane_type, lane_type.value.upper())
+            add(prefix, lane_type, count)
 
     customers_rows_dia: list[dict] = []
     time_log_dia: list[dict] = []
@@ -2807,56 +3152,13 @@ def _simular_dia_periodo(
         if frac_sec > 0:
             current_cum_lambda += frac_sec * lambda_total_per_sec[start_rel_sec]
 
-    # Cargar modelo KDE si existe
-    kde_model = None
-    if "ARRIVAL_KDE_MODEL" in globals() and ARRIVAL_KDE_MODEL is not None:
-        kde_model = ARRIVAL_KDE_MODEL
-
-    # Pre-generar deltas para evitar overhead de llamadas a sample() en el loop
-    # Estimamos un maximo generoso de clientes por dia (ej. 50000)
-    # Si se acaba el buffer, se genera mas bajo demanda
-    _KDE_BUFFER_SIZE = 50000
-    _kde_buffer = None
-    _kde_idx = 0
+    # Ya no usamos KDE - usar distribucion Gamma directamente
+    # Gamma(shape=1.303, scale=0.815) ajusta mejor segun analisis estadistico
     
-    if kde_model is not None:
-        try:
-            # Generar en lote es mucho mas rapido
-            _kde_buffer = kde_model.sample(_KDE_BUFFER_SIZE, random_state=arrival_rng.integers(0, 2**32 - 1))
-            if _kde_buffer.ndim > 1:
-                _kde_buffer = _kde_buffer.flatten()
-            _kde_buffer = np.maximum(1e-6, _kde_buffer)
-        except Exception as e:
-            print(f"[WARN] Fallo pre-generacion KDE: {e}")
-            _kde_buffer = None
-
     while True:
-        # Generar intervalo en "tiempo operacional" (unidades de demanda esperada)
-        delta_tau = 0.0
-        
-        if _kde_buffer is not None:
-            if _kde_idx < len(_kde_buffer):
-                delta_tau = float(_kde_buffer[_kde_idx])
-                _kde_idx += 1
-            else:
-                # Se acabo el buffer, generar uno nuevo (fallback o recarga pequeÃ±a)
-                try:
-                    sample = kde_model.sample(1000, random_state=arrival_rng.integers(0, 2**32 - 1))
-                    if sample.ndim > 1:
-                        sample = sample.flatten()
-                    _kde_buffer = np.maximum(1e-6, sample)
-                    _kde_idx = 1
-                    delta_tau = float(_kde_buffer[0])
-                except Exception:
-                     # Fallback a Lognormal
-                    _sigma = ARRIVAL_LOGNORMAL_SIGMA
-                    _mu = -(_sigma**2) / 2.0
-                    delta_tau = arrival_rng.lognormal(_mu, _sigma)
-        else:
-            # E[X] = 1.0 -> Lognormal(mu, sigma) con mu = -sigma^2/2
-            _sigma = ARRIVAL_LOGNORMAL_SIGMA
-            _mu = -(_sigma**2) / 2.0
-            delta_tau = arrival_rng.lognormal(_mu, _sigma)
+        # Generar intervalo en "tiempo operacional" usando Gamma
+        # E[delta_tau] = shape * scale = 1.303 * 0.815 = 1.062
+        delta_tau = arrival_rng.gamma(ARRIVAL_GAMMA_SHAPE, ARRIVAL_GAMMA_SCALE)
 
         target_cum = current_cum_lambda + delta_tau
 

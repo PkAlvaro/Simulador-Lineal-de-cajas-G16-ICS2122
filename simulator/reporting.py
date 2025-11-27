@@ -173,6 +173,7 @@ def export_formatted_excel_report(
     hv_df: Optional[pd.DataFrame],
     client_counts_df: Optional[pd.DataFrame],
     little_df: Optional[pd.DataFrame],
+    profit_anual_estimado: float = 0.0,
 ) -> Optional[Path]:
     try:
         import xlsxwriter  # noqa: F401
@@ -264,38 +265,47 @@ def export_formatted_excel_report(
 
     if tac_df is not None and not tac_df.empty:
         ws_tac_profile = wb.add_worksheet("TAC_Perfil")
-        ws_tac_profile.merge_range(0, 0, 0, 10, "TAC por perfil", fmt_header)
+        ws_tac_profile.merge_range(0, 0, 0, 3, "TAC por perfil", fmt_header)
         ws_tac_profile.write_row(
             2,
             0,
             [
                 "Perfil",
-                "Served (sim %)",
-                "Served (teo %)",
-                "Error % served",
-                "Abandoned (sim %)",
-                "Abandoned (teo %)",
-                "Error % abandoned",
-                "Balked (sim %)",
-                "Balked (teo %)",
-                "Error % balked",
+                "TAC Teorico (%)",
+                "TAC Simulado (%)",
+                "Error (%)",
             ],
             fmt_subheader,
         )
+        
+        # Calcular TAC usando la formula: TAC = (abandoned + balked) / (served + abandoned + balked) * 100
         for idx, row in tac_df.iterrows():
             ws_tac_profile.write(3 + idx, 0, row.get("profile"), fmt_text)
-            served_est = row.get("served_pct_est", row.get("served_pct"))
-            aband_est = row.get("abandoned_pct_est", row.get("abandoned_pct"))
-            balked_est = row.get("balked_pct_est", row.get("balked_pct"))
-            _write_number_safe(ws_tac_profile, 3 + idx, 1, served_est, fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 2, row.get("served_pct_teo"), fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 3, row.get("served_pct_rel_err_pct"), fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 4, aband_est, fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 5, row.get("abandoned_pct_teo"), fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 6, row.get("abandoned_pct_rel_err_pct"), fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 7, balked_est, fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 8, row.get("balked_pct_teo"), fmt_percent)
-            _write_number_safe(ws_tac_profile, 3 + idx, 9, row.get("balked_pct_rel_err_pct"), fmt_percent)
+            
+            # Obtener conteos simulados
+            served_sim = row.get("served_est", row.get("served", 0))
+            abandoned_sim = row.get("abandoned_est", row.get("abandoned", 0))
+            balked_sim = row.get("balked_est", row.get("balked", 0))
+            
+            # Obtener conteos teoricos
+            served_teo = row.get("served_teo", 0)
+            abandoned_teo = row.get("abandoned_teo", 0)
+            balked_teo = row.get("balked_teo", 0)
+            
+            # Calcular TAC simulado
+            total_sim = served_sim + abandoned_sim + balked_sim
+            tac_sim = ((abandoned_sim + balked_sim) / total_sim * 100.0) if total_sim > 0 else np.nan
+            
+            # Calcular TAC teorico
+            total_teo = served_teo + abandoned_teo + balked_teo
+            tac_teo = ((abandoned_teo + balked_teo) / total_teo * 100.0) if total_teo > 0 else np.nan
+            
+            # Calcular error
+            tac_error = ((tac_sim - tac_teo) / tac_teo * 100.0) if (tac_teo and tac_teo != 0) else np.nan
+            
+            _write_number_safe(ws_tac_profile, 3 + idx, 1, tac_teo, fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 2, tac_sim, fmt_percent)
+            _write_number_safe(ws_tac_profile, 3 + idx, 3, tac_error, fmt_percent)
         counts_start = 4 + len(tac_df)
         if client_counts_df is not None and not client_counts_df.empty:
             ws_tac_profile.merge_range(counts_start, 0, counts_start, 6, "Conteo por perfil y tipo de dia", fmt_header)
@@ -460,6 +470,75 @@ def export_formatted_excel_report(
             _write_number_safe(ws_little, r, 10, row.get("L_value_est"), fmt_decimal)
             _write_number_safe(ws_little, r, 11, row.get("L_value_teo"), fmt_decimal)
             _write_number_safe(ws_little, r, 12, row.get("L_value_rel_err_pct"), fmt_percent)
+
+    # Nueva hoja: Costos Financieros
+    try:
+        from .optimizador_cajas import calculate_financial_metrics
+        
+        # Obtener configuración actual de cajas
+        current_policy = engine.get_current_lane_policy()
+        
+        # Calcular métricas financieras usando profit bruto anual estimado
+        metrics = calculate_financial_metrics(current_policy, profit_anual_estimado)
+        
+        ws_costos = wb.add_worksheet("Costos_Financieros")
+        ws_costos.merge_range(0, 0, 0, 3, "Analisis Financiero del Proyecto", fmt_header)
+        
+        # Configuración de cajas
+        ws_costos.merge_range(2, 0, 2, 3, "Configuracion de Cajas", fmt_subheader)
+        ws_costos.write(3, 0, "Tipo de Caja", fmt_text)
+        ws_costos.write(3, 1, "Cantidad", fmt_text)
+        row_idx = 4
+        for lane_type in ["regular", "express", "priority", "self_checkout"]:
+            ws_costos.write(row_idx, 0, lane_type.replace("_", " ").title(), fmt_text)
+            ws_costos.write(row_idx, 1, current_policy.get(lane_type, 0), fmt_number)
+            row_idx += 1
+        
+        ws_costos.write(row_idx, 0, "Total Cajas", fmt_subheader)
+        ws_costos.write(row_idx, 1, sum(current_policy.values()), fmt_number)
+        row_idx += 2
+        
+        # Métricas Financieras
+        ws_costos.merge_range(row_idx, 0, row_idx, 3, "Metricas Financieras (Horizonte 2025-2030)", fmt_subheader)
+        row_idx += 1
+        
+        financial_items = [
+            ("Inversion Inicial (CAPEX)", metrics["capex"]),
+            ("OPEX Anual Promedio", metrics["opex_anual_promedio"]),
+            ("Profit Bruto Anual (Simulado)", metrics["gross_profit"]),
+            ("EBITDA Anual Promedio", metrics["ebitda_anual_promedio"]),
+            ("FCF Anual Promedio", metrics["fcf_anual_promedio"]),
+            ("", None),  # Línea en blanco
+            ("VPN del Proyecto (5-6 anos, 8.54%)", metrics["npv"]),
+        ]
+        
+        for label, value in financial_items:
+            if value is None:
+                row_idx += 1
+                continue
+            ws_costos.write(row_idx, 0, label, fmt_text)
+            _write_number_safe(ws_costos, row_idx, 1, value, fmt_number)
+            row_idx += 1
+        
+        # Parámetros usados
+        row_idx += 1
+        ws_costos.merge_range(row_idx, 0, row_idx, 3, "Parametros Financieros", fmt_subheader)
+        row_idx += 1
+        
+        params = [
+            ("Tasa de Impuesto (Primera Categoria)", "27%"),
+            ("Tasa de Descuento (Costo de Capital)", "8.54%"),
+            ("Horizonte de Proyeccion", "2025-2030"),
+        ]
+        
+        for label, value in params:
+            ws_costos.write(row_idx, 0, label, fmt_text)
+            ws_costos.write(row_idx, 1, value, fmt_text)
+            row_idx += 1
+            
+    except ImportError:
+        # Si no se puede importar calculate_financial_metrics, omitir esta hoja
+        pass
 
     wb.close()
     return excel_path
@@ -1156,6 +1235,7 @@ def run_full_workflow(
         hv_df=hv_formatted_df,
         client_counts_df=client_counts_df,
         little_df=little_summary_df,
+        profit_anual_estimado=prof_clp_estimado_anual,
     )
     if formatted_path:
         print(f"Reporte formateado exportado a {formatted_path}")

@@ -46,7 +46,7 @@ def iter_customer_files(root: Path) -> Iterable[tuple[Path, str]]:
 
 def load_dataset(root: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
-    base_cols = ["profile", "priority", "payment_method", "patience_s", "outcome"]
+    base_cols = ["profile", "priority", "payment_method", "patience_s", "wait_time_s", "outcome"]
     for csv_path, day_type in iter_customer_files(root):
         try:
             df = pd.read_csv(csv_path)
@@ -59,6 +59,18 @@ def load_dataset(root: Path) -> pd.DataFrame:
             continue
         df = df[base_cols].copy()
         df["day_type"] = day_type
+        
+        # Normalizar outcome
+        df["outcome"] = df["outcome"].replace({"abandon": "abandoned", "balk": "balked"})
+        
+        # CRUCIAL: Para abandonados, usar wait_time_s (tiempo real de abandono)
+        # Para otros, usar patience_s como fallback
+        mask_abandoned = df["outcome"] == "abandoned"
+        df.loc[mask_abandoned, "patience_s"] = df.loc[mask_abandoned, "wait_time_s"].fillna(df.loc[mask_abandoned, "patience_s"])
+        
+        # SOLO usar clientes que abandonaron para el ajuste (estos son los que revelan paciencia real)
+        df = df[mask_abandoned].copy()
+        
         df["profile"] = df["profile"].astype(str).str.strip().str.lower()
         df["priority"] = df["priority"].astype(str).str.strip().str.lower()
         df["payment_method"] = df["payment_method"].astype(str).str.strip().str.lower()

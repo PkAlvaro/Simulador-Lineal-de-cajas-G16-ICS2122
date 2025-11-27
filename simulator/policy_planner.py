@@ -60,28 +60,48 @@ def evaluate_base_performance(
     )
 
 
-def _normalize_lane_tuple(raw: Any) -> tuple[int, int, int, int] | None:
+def _normalize_lane_tuple(raw: Any) -> tuple[int, ...] | None:
     if raw is None:
         return None
     if isinstance(raw, dict):
+        # If dict, convert to tuple (replicated for blocks if needed, but here we might just return base tuple
+        # and let the optimizer expand it? No, we should probably expand it here if we want consistency)
+        # But wait, raw dict usually means single block.
+        # Let's assume if dict, it's a single block config.
         seq = [raw.get(lane, raw.get(lane.upper(), 0)) for lane in LANE_ORDER]
+        # We need to expand it to full schedule length if we are in schedule mode.
+        # But policy_planner doesn't know about TIME_BLOCKS directly unless we import.
+        # Let's import TIME_BLOCKS from optimizador_cajas
+        from simulator.optimizador_cajas import TIME_BLOCKS
+        
+        base = tuple(int(max(0, x)) for x in seq)
+        return base * len(TIME_BLOCKS)
+        
     else:
         try:
             seq = list(raw)
         except TypeError:
             return None
-    if len(seq) < len(LANE_ORDER):
+
+    if len(seq) == 0 or len(seq) % 4 != 0:
         return None
-    try:
-        tuple_counts = tuple(int(max(0, seq[idx])) for idx in range(len(LANE_ORDER)))
-    except (TypeError, ValueError):
-        return None
-    counts_dict = {lane: tuple_counts[idx] for idx, lane in enumerate(LANE_ORDER)}
-    try:
-        normalized = engine.enforce_lane_constraints(counts_dict.copy())
-        return tuple(int(normalized.get(lane, 0)) for lane in LANE_ORDER)
-    except AttributeError:
-        return tuple_counts
+
+    # Enforce constraints per block
+    from simulator import engine
+    
+    final_seq = []
+    num_blocks = len(seq) // 4
+    
+    for i in range(num_blocks):
+        block = seq[i*4 : (i+1)*4]
+        counts_dict = {lane: int(max(0, block[idx])) for idx, lane in enumerate(LANE_ORDER)}
+        try:
+            normalized = engine.enforce_lane_constraints(counts_dict.copy())
+            final_seq.extend(int(normalized.get(lane, 0)) for lane in LANE_ORDER)
+        except AttributeError:
+            final_seq.extend(int(max(0, x)) for x in block)
+            
+    return tuple(final_seq)
 
 
 def _seed_for_day(
@@ -268,6 +288,12 @@ def plan_multi_year_optimization(
     #          evaluando año por año con evaluate_policy_saa (Stage 2).
     #   - yearly_results se llena siempre con la política fija elegida.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Modo "single_investment":
+    #   - Tomamos la política óptima del año base (2025).
+    #   - La evaluamos ("estresamos") contra las demandas proyectadas de los años futuros.
+    #   - NO re-optimizamos. Solo medimos el desempeño de mantener la infraestructura fija.
+    # ------------------------------------------------------------------
     if single_investment:
         if evaluate_policy_saa is None:
             raise RuntimeError(
@@ -277,122 +303,55 @@ def plan_multi_year_optimization(
         eval_weeks = eval_weeks_default
         eval_reps = eval_reps_default
 
-        per_segment_candidates: Dict[
-            str, Dict[DayType, set[tuple[int, int, int, int]]]
-        ] = {}
+        print("\n[PLAN] Evaluando política base fija frente a demanda futura (sin re-optimizar)...")
 
-        # Stage 1: optimizar años por separado
         for segment in segments:
             seg_name = str(segment)
-            print(f"\n[PLAN] Optimizando anos por separado para segmento {seg_name}...")
-
-            seg_prev = {
-                dt: base_seed_per_day[dt] for dt in day_types if dt in base_seed_per_day
-            }
-            candidate_policies: Dict[
-                DayType, set[tuple[int, int, int, int]]
-            ] = {dt: set() for dt in day_types}
-
-            # siempre incluir la política base como candidata
-            for dt in day_types:
-                base_policy = base_seed_per_day.get(dt)
-                if base_policy is not None:
-                    candidate_policies[dt].add(base_policy)
-
-            tasks = []
+            
+            # Tareas para evaluar en paralelo si se desea
+            eval_tasks = []
+            
             for year in year_sequence:
-                factor = float(
-                    expectations.get(seg_name, {}).get(str(year), 1.0)
-                )
+                factor = float(expectations.get(seg_name, {}).get(str(year), 1.0))
+                
                 for dt in day_types:
-                    initial = seg_prev.get(dt)
-                    tasks.append(
-                        (
-                            str(year),
-                            seg_name,
-                            dt.value,
-                            float(factor),
-                            initial,
-                            optimizer_kwargs,
+                    # Política a evaluar: la óptima del año base
+                    policy_to_eval = base_seed_per_day.get(dt)
+                    if policy_to_eval is None:
+                        continue
+                        
+                    # Preparamos la tarea (podríamos paralelizar, pero evaluate_policy_saa es rápido si reps es bajo)
+                    # Para simplificar y evitar problemas de pickling con closures, lo hacemos secuencial o usamos un worker simple.
+                    # Dado que evaluate_policy_saa puede ser costoso, usaremos el pool si max_workers > 1
+                    
+                    # Definimos una función helper global o usamos una lambda picklable? No.
+                    # Usaremos un bloque try-except dentro del loop secuencial por robustez en Windows,
+                    # a menos que el usuario pida explícitamente paralelismo masivo.
+                    
+                    # Ejecución Secuencial (más segura en Windows para llamadas directas)
+                    prev_factor = engine.get_demand_multiplier()
+                    engine.set_demand_multiplier(factor)
+                    try:
+                        res = evaluate_policy_saa(
+                            policy_to_eval,
+                            day_type=dt,
+                            num_weeks_sample=eval_weeks,
+                            num_rep=eval_reps,
+                            eval_context=(
+                                f"Ano={year} | Segmento={seg_name} | "
+                                f"POLITICA-FIJA (Base 2025)"
+                            ),
                         )
-                    )
-
-            if tasks:
-                with ProcessPoolExecutor(max_workers=max_workers) as pool:
-                    futures = {
-                        pool.submit(_optimizer_worker, task): task for task in tasks
-                    }
-                    for fut in as_completed(futures):
-                        year_val, segment_name, day_value, factor, result = fut.result()
-                        dt = DayType(day_value)
-                        seg_prev[dt] = tuple(int(v) for v in result.x)
-                        candidate_policies[dt].add(tuple(int(v) for v in result.x))
+                        yearly_results.setdefault(str(year), {}).setdefault(seg_name, {})[dt] = res
+                        
                         print(
-                            f"[PLAN] (single) Segmento {segment_name} ano {year_val} "
-                            f"tipo {dt.name}: factor {factor:.4f} "
-                            f"-> objetivo {getattr(result, 'objetivo_mean', float('nan')):,.0f}"
+                            f"[PLAN] Segmento {seg_name} ano {year} tipo {dt.name}: "
+                            f"factor {factor:.4f} -> Profit {res.profit_mean*365:,.0f} | VPN {res.objetivo_mean:,.0f}"
                         )
-
-            per_segment_candidates[seg_name] = candidate_policies
-
-        # Stage 2: elegir política fija por segmento y tipo de día
-        for segment in segments:
-            seg_name = str(segment)
-            seg_candidates = per_segment_candidates.get(seg_name, {})
-
-            for dt in day_types:
-                policies = list(seg_candidates.get(dt, set()))
-                if not policies:
-                    continue
-
-                best_policy: Optional[tuple[int, int, int, int]] = None
-                best_total_obj = float("-inf")
-                best_year_evals: Dict[str, Any] = {}
-
-                for policy in policies:
-                    total_obj = 0.0
-                    year_evals: Dict[str, Any] = {}
-                    for year in year_sequence:
-                        factor = float(
-                            expectations.get(seg_name, {}).get(str(year), 1.0)
-                        )
-                        prev_factor = engine.get_demand_multiplier()
-                        engine.set_demand_multiplier(factor)
-                        try:
-                            res = evaluate_policy_saa(
-                                policy,
-                                day_type=dt,
-                                num_weeks_sample=eval_weeks,
-                                num_rep=eval_reps,
-                                eval_context=(
-                                    f"Ano={year} | Segmento={seg_name} | "
-                                    f"POLITICA-CANDIDATA {policy}"
-                                ),
-                            )
-                        finally:
-                            engine.set_demand_multiplier(prev_factor)
-
-                        year_evals[str(year)] = res
-                        total_obj += getattr(res, "objetivo_mean", float("-inf"))
-
-                    if total_obj > best_total_obj:
-                        best_total_obj = total_obj
-                        best_policy = policy
-                        best_year_evals = year_evals
-
-                if best_policy is None:
-                    continue
-
-                print(
-                    f"[PLAN] Segmento {seg_name} tipo {dt.name}: "
-                    f"politica fija elegida {best_policy} "
-                    f"con objetivo acumulado {best_total_obj:,.0f}"
-                )
-
-                for year, res in best_year_evals.items():
-                    yearly_results.setdefault(str(year), {}).setdefault(seg_name, {})[
-                        dt
-                    ] = res
+                    except Exception as e:
+                        print(f"[ERROR] Falló evaluación para {year}/{seg_name}/{dt.name}: {e}")
+                    finally:
+                        engine.set_demand_multiplier(prev_factor)
 
         engine.set_demand_multiplier(1.0)
 
